@@ -1,6 +1,8 @@
 # tabs only
 from PySide6.QtCore import QObject, Signal, QThread
 import pathlib, traceback, time, random
+from contextlib import nullcontext
+from dataclasses import dataclass, replace
 import subprocess
 import json
 import sqlite3
@@ -140,6 +142,51 @@ def _run_yt_dlp_command(cmd: list[str], *, timeout: int) -> subprocess.Completed
 		timeout=timeout,
 		**subprocess_kwargs()
 	)
+
+def _new_payload(track: Dict, options: List[Dict], match: Dict | None, confidence: float, playlist_name: str, forced_match: bool) -> Dict:
+	return {
+		"track": track,
+		"options": options,
+		"match": match,
+		"confidence": confidence,
+		"skipped": False,
+		"error": None,
+		"playlist_name": playlist_name,
+		"file_path": None,
+		"downloaded": False,
+		"cover_bytes": None,
+		"forced_match": forced_match
+	}
+
+
+@dataclass(frozen=True)
+class TrackJob:
+	row_idx: int
+	track: Dict
+	match: Dict
+	options: List[Dict]
+	confidence: float
+	low_confidence: bool
+	forced_match: bool
+	candidate_sequence: List[Dict]
+	dest_dir: pathlib.Path
+	base: str
+	profile: YouTubeMitigationProfile
+	audio_processing: Dict
+	safe_mode: bool
+	playlist_name: str
+	track_playlist_name: str
+
+
+@dataclass
+class TrackOutcome:
+	row_idx: int
+	payload: Dict
+	fp: pathlib.Path | None = None
+	cover: bytes | None = None
+	error: str | None = None
+	risk_reason: str | None = None
+
 
 class PipelineWorker(QThread):
 	sig_log = Signal(str)                       # log strings
@@ -315,6 +362,82 @@ class PipelineWorker(QThread):
 			return f"Safe mode: {base[0].lower()}{base[1:]}"
 		return base
 
+	def _emit(self, kind: str, *args) -> None:
+		{"status": self.sig_row_status, "warning": self.sig_warning, "log": self.sig_log}[kind].emit(*args)
+
+	def _run_job(self, job: "TrackJob") -> "TrackOutcome":
+		outcome = self._process_track(job, self._emit)
+		if outcome.risk_reason:
+			self._apply_mitigation(YOUTUBE_MITIGATION_AGGRESSIVE, outcome.risk_reason)
+			self.sig_row_status.emit(job.row_idx, "Retrying with YouTube safe mode…")
+			outcome = self._process_track(replace(job, profile=YOUTUBE_MITIGATION_AGGRESSIVE, safe_mode=True), self._emit)
+		return outcome
+
+	def _report_quality(self, outcome: "TrackOutcome", title: str) -> None:
+		if outcome.error is not None:
+			return
+		from csvmusic.core.audio_quality import audio_quality
+		quality = audio_quality(outcome.fp)
+		outcome.payload["audio_quality"] = quality
+		if quality["low"]:
+			self._emit("log", f"[warn] Low YouTube source bitrate: {title} — {quality['codec']} ~{quality['kbps']} kbps")
+			self._emit("status", outcome.row_idx, "Downloaded — low quality")
+
+	def _try_candidates(self, job: "TrackJob", emit):
+		stage = (lambda _name: nullcontext()) if job.safe_mode else timed
+		sequence = job.candidate_sequence
+		fallback_attempts = self.force_download and len(sequence) > 1
+		last_err = None
+		fp = None
+		cover = None
+		chosen = None
+		for attempt_idx, candidate in enumerate(sequence, start=1):
+			vid = candidate["videoId"]
+			if fallback_attempts:
+				emit("status", job.row_idx, self._attempt_status_text(candidate, attempt_idx, len(sequence), safe_mode=job.safe_mode))
+			try:
+				with stage("download"):
+					fp = self._download_with_profile(vid, job.dest_dir, job.base, job.profile)
+				emit("status", job.row_idx, "Tagging…")
+				with stage("cover"):
+					cover = _track_cover_bytes(job.track, vid)
+				tag_file(fp, job.track, cover if self.embed_art else None, cover_size=_legacy_cover_size(self.legacy_options, embed_art=self.embed_art))
+				chosen = candidate
+				break
+			except AgeRestrictedError:
+				raise
+			except Exception as candidate_exc:
+				last_err = str(candidate_exc)
+		if fp is None:
+			raise RuntimeError(last_err or "Download failed.")
+		return fp, cover, chosen
+
+	def _process_track(self, job: "TrackJob", emit) -> "TrackOutcome":
+		self._active_audio_processing = job.audio_processing
+		payload = _new_payload(job.track, job.options, job.match, job.confidence, job.track_playlist_name, job.forced_match)
+		payload["low_confidence"] = job.low_confidence
+		outcome = TrackOutcome(job.row_idx, payload)
+		try:
+			fp, cover, chosen = self._try_candidates(job, emit)
+			if chosen is not None:
+				payload["match"] = chosen
+			emit("status", job.row_idx, f"{'Low confidence' if job.low_confidence else 'Done'} → {fp.name}")
+			outcome.fp = fp
+			outcome.cover = cover
+			payload.update(error=None, downloaded=True, file_path=str(fp), cover_bytes=cover)
+			return outcome
+		except Exception as exc:
+			err = str(exc)
+			risk_reason = detect_youtube_risk(err)
+			if risk_reason and not job.safe_mode and job.profile.label != YOUTUBE_MITIGATION_AGGRESSIVE.label:
+				outcome.risk_reason = risk_reason
+				return outcome
+			log(f"download failure: playlist='{job.playlist_name}' track='{job.track['artists']} — {job.track['title']}' fmt={self.fmt} error={err}")
+			emit("status", job.row_idx, f"Fail: {err[:120]}")
+			outcome.error = err
+			payload["error"] = err
+			return outcome
+
 	def run(self):
 		try:
 			self.sig_log.emit("[csv] loading…")
@@ -396,27 +519,13 @@ class PipelineWorker(QThread):
 				else:
 					consecutive_search_errors = 0
 					consecutive_empty_searches = 0
-				payload = {
-					"track": t,
-					"options": options,
-					"match": match,
-					"confidence": confidence,
-					"skipped": False,
-					"error": None,
-					"playlist_name": track_playlist_name,
-					"file_path": None,
-					"downloaded": False,
-					"cover_bytes": None,
-					"forced_match": False
-				}
-
+				forced = False
 				if match is None and self.force_download and options:
 					forced_candidates = self._force_download_candidates(t, options)
 					match = forced_candidates[0] if forced_candidates else options[0]
 					confidence = float(match.get("score", confidence or 0.0) or 0.0)
-					payload["match"] = match
-					payload["confidence"] = confidence
-					payload["forced_match"] = True
+					forced = True
+				payload = _new_payload(t, options, match, confidence, track_playlist_name, forced)
 
 				if match is None:
 					if search_error:
@@ -453,113 +562,35 @@ class PipelineWorker(QThread):
 						time.sleep(self._track_pause_s())
 					continue
 
-				payload["match"] = match
 				matched += 1
 				self.sig_match_stats.emit(matched, skipped_count)
-				vid = match["videoId"]
-				low_confidence = payload.get("forced_match") or confidence < CONFIDENCE_MIN
-				payload["low_confidence"] = bool(low_confidence)
-				if low_confidence:
-					self.sig_row_status.emit(row_idx, f"Downloading low-confidence match ({self.fmt})…")
-				else:
-					self.sig_row_status.emit(row_idx, f"Downloading ({self.fmt})…")
-				error_msg = None
-				candidate_sequence = self._ordered_force_candidates(t, match, options)
-				fallback_attempts_enabled = self.force_download and len(candidate_sequence) > 1
-
+				low_confidence = bool(forced or confidence < CONFIDENCE_MIN)
+				self.sig_row_status.emit(row_idx, f"Downloading low-confidence match ({self.fmt})…" if low_confidence else f"Downloading ({self.fmt})…")
 				try:
-					base = track_filename_base(t)
-					last_err = None
-					fp = None
-					cover = None
-					for attempt_idx, candidate in enumerate(candidate_sequence, start=1):
-						vid = candidate["videoId"]
-						if fallback_attempts_enabled:
-							self.sig_row_status.emit(
-								row_idx,
-								self._attempt_status_text(candidate, attempt_idx, len(candidate_sequence))
-							)
-						try:
-							with timed("download"):
-								fp = self._download_with_profile(vid, dest_dir, base, self._mitigation)
-							self.sig_row_status.emit(row_idx, "Tagging…")
-							with timed("cover"):
-								cover = _track_cover_bytes(t, vid)
-							tag_file(fp, t, cover if self.embed_art else None, cover_size=_legacy_cover_size(self.legacy_options, embed_art=self.embed_art))
-							payload["match"] = candidate
-							break
-						except AgeRestrictedError:
-							raise
-						except Exception as candidate_exc:
-							last_err = str(candidate_exc)
-					if fp is None:
-						raise RuntimeError(last_err or "Download failed.")
-					if low_confidence:
-						self.sig_row_status.emit(row_idx, f"Low confidence → {fp.name}")
-					else:
-						self.sig_row_status.emit(row_idx, f"Done → {fp.name}")
+					job = TrackJob(
+						row_idx=row_idx, track=t, match=match, options=options, confidence=confidence,
+						low_confidence=low_confidence, forced_match=forced,
+						candidate_sequence=self._ordered_force_candidates(t, match, options),
+						dest_dir=dest_dir, base=track_filename_base(t), profile=self._mitigation,
+						audio_processing=self._active_audio_processing, safe_mode=False,
+						playlist_name=playlist_name, track_playlist_name=track_playlist_name,
+					)
+					outcome = self._run_job(job)
+				except Exception as exc:
+					err = str(exc)
+					log(f"download failure: playlist='{playlist_name}' track='{artists} — {title}' fmt={self.fmt} error={err}")
+					self.sig_row_status.emit(row_idx, f"Fail: {err[:120]}")
+					payload.update(match=match, low_confidence=low_confidence, error=err)
+					outcome = TrackOutcome(row_idx, payload, error=err)
+				if outcome.error is None:
 					done_tracks.append(t)
-				except Exception as e:
-					err = str(e)
-					risk_reason = detect_youtube_risk(err)
-					retried = False
-					if risk_reason and self._mitigation.label != YOUTUBE_MITIGATION_AGGRESSIVE.label:
-						self._apply_mitigation(YOUTUBE_MITIGATION_AGGRESSIVE, risk_reason)
-						try:
-							self.sig_row_status.emit(row_idx, "Retrying with YouTube safe mode…")
-							last_retry_err = None
-							fp = None
-							cover = None
-							for attempt_idx, candidate in enumerate(candidate_sequence, start=1):
-								vid = candidate["videoId"]
-								if fallback_attempts_enabled:
-									self.sig_row_status.emit(
-										row_idx,
-										self._attempt_status_text(candidate, attempt_idx, len(candidate_sequence), safe_mode=True)
-									)
-								try:
-									fp = self._download_with_profile(vid, dest_dir, base, self._mitigation)
-									self.sig_row_status.emit(row_idx, "Tagging…")
-									cover = _track_cover_bytes(t, vid)
-									tag_file(fp, t, cover if self.embed_art else None, cover_size=_legacy_cover_size(self.legacy_options, embed_art=self.embed_art))
-									payload["match"] = candidate
-									break
-								except AgeRestrictedError:
-									raise
-								except Exception as retry_candidate_exc:
-									last_retry_err = str(retry_candidate_exc)
-							if fp is None:
-								raise RuntimeError(last_retry_err or "Download failed.")
-							if low_confidence:
-								self.sig_row_status.emit(row_idx, f"Low confidence → {fp.name}")
-							else:
-								self.sig_row_status.emit(row_idx, f"Done → {fp.name}")
-							done_tracks.append(t)
-							retried = True
-						except Exception as retry_exc:
-							err = str(retry_exc)
-					if not retried:
-						log(f"download failure: playlist='{playlist_name}' track='{artists} — {title}' fmt={self.fmt} error={err}")
-						self.sig_row_status.emit(row_idx, f"Fail: {err[:120]}")
-						failed_tracks.append({"track": t, "error": err})
-						error_msg = err
-				finally:
-					processed += 1
-					self.sig_progress.emit(processed, total)
-
-				payload["error"] = error_msg
-				if error_msg is None:
-					payload["downloaded"] = True
-					payload["file_path"] = str(fp)
-					payload["cover_bytes"] = cover
-					from csvmusic.core.audio_quality import audio_quality
-					quality = audio_quality(fp)
-					payload["audio_quality"] = quality
-					if quality["low"]:
-						self.sig_log.emit(f"[warn] Low YouTube source bitrate: {title} — {quality['codec']} ~{quality['kbps']} kbps")
-						self.sig_row_status.emit(row_idx, "Downloaded — low quality")
-				log(f"timing: stage=track seconds={time.monotonic() - track_started:.1f} ok={error_msg is None}")
-				self.sig_track_result.emit(row_idx, payload)
+				else:
+					failed_tracks.append({"track": t, "error": outcome.error})
+				processed += 1
+				self.sig_progress.emit(processed, total)
+				self._report_quality(outcome, title)
+				log(f"timing: stage=track seconds={time.monotonic() - track_started:.1f} ok={outcome.error is None}")
+				self.sig_track_result.emit(row_idx, outcome.payload)
 				if not self._stop and idx < total - 1:
 					with timed("pause"):
 						time.sleep(self._track_pause_s())
