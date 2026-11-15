@@ -382,7 +382,7 @@ def _run_ytdlp_detail(cmd: list[str]) -> tuple[int, str]:
 		log(f"yt-dlp recovery failed: {detail}")
 		return public_rc, detail
 	detail = _summarize_tool_output(stderr, stdout, using_cookies=_cmd_uses_cookies(cmd))
-	log(f"yt-dlp failed rc={rc}: {detail}")
+	log(f"yt-dlp failed rc={rc} url={cmd[-1]}: {detail}")
 	if is_age_restriction_error(detail):
 		# Preserve the actionable error instead of masking it with later client,
 		# format, or search failures (or downloading a different video).
