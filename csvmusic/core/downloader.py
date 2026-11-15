@@ -4,7 +4,7 @@ from dataclasses import dataclass, replace
 from collections.abc import Callable
 from typing import Dict, Optional, List
 import re, unicodedata
-import threading, time, random
+import threading, time, random, functools
 from mutagen.easyid3 import EasyID3
 from mutagen.id3 import ID3, APIC
 from mutagen.mp4 import MP4, MP4Cover
@@ -623,13 +623,33 @@ def _cleanup_outputs(dir: pathlib.Path, base: str) -> None:
 			pass
 
 
-def _replace_file(src: pathlib.Path, dst: pathlib.Path) -> None:
-	if dst.exists():
+def _encode_to_final(args: list[str], dst: pathlib.Path) -> subprocess.CompletedProcess[str]:
+	"""Run ffmpeg into `<stem>.part<ext>` and publish it atomically, so a cancelled or failed
+	encode never leaves a truncated file under the final name."""
+	part = dst.with_name(dst.stem + ".part" + dst.suffix)
+	published = False
+	try:
+		proc = _run_capture(args + [str(part)])
+		if proc.returncode == 0 and part.exists():
+			os.replace(part, dst)
+			published = True
+		return proc
+	finally:
+		if not published:
+			try: part.unlink()
+			except OSError: pass
+
+
+def _cleanup_on_failure(fn):
+	"""Drop staging and partial files for this track if the download raises (including cancel)."""
+	@functools.wraps(fn)
+	def wrapper(video_id: str, dst_dir: pathlib.Path, base_name: str, *args, **kwargs):
 		try:
-			dst.unlink()
-		except Exception:
-			pass
-	src.replace(dst)
+			return fn(video_id, dst_dir, base_name, *args, **kwargs)
+		except BaseException:
+			_cleanup_outputs(dst_dir, _safe(base_name))
+			raise
+	return wrapper
 
 
 def _audio_processing_enabled(audio_processing: Dict | None) -> bool:
@@ -709,41 +729,26 @@ def _append_audio_filter(args: list[str], audio_processing: Dict | None, src: pa
 
 
 def _normalize_to_m4a(src: pathlib.Path, dst: pathlib.Path, ffmpeg_bin: str, video_id: str, audio_processing: Dict | None = None) -> pathlib.Path:
-	tmp_dst = dst.with_name(dst.stem + ".normalized.m4a")
-	if tmp_dst.exists():
-		try:
-			tmp_dst.unlink()
-		except Exception:
-			pass
-
 	if not _audio_processing_enabled(audio_processing):
-		proc = _run_capture([ffmpeg_bin, "-y", "-i", str(src), "-vn", "-sn", "-c:a", "copy", str(tmp_dst)])
-		rc = proc.returncode
-		if rc == 0 and tmp_dst.exists():
+		proc = _encode_to_final([ffmpeg_bin, "-y", "-i", str(src), "-vn", "-sn", "-c:a", "copy"], dst)
+		if proc.returncode == 0 and dst.exists():
 			if src != dst:
 				try: src.unlink()
 				except Exception: pass
-			_replace_file(tmp_dst, dst)
 			return dst
 
 	args = [ffmpeg_bin, "-y", "-i", str(src), "-vn", "-sn"]
 	_append_audio_filter(args, audio_processing, src=src, ffmpeg_bin=ffmpeg_bin)
-	args += ["-c:a", "aac", "-b:a", "192k", str(tmp_dst)]
-	proc = _run_capture(args)
+	args += ["-c:a", "aac", "-b:a", "192k"]
+	proc = _encode_to_final(args, dst)
 	rc = proc.returncode
 	detail = _summarize_tool_output(proc.stderr or "", proc.stdout or "")
-	if rc == 0 and tmp_dst.exists():
+	if rc == 0 and dst.exists():
 		if src != dst:
 			try: src.unlink()
 			except Exception: pass
-		_replace_file(tmp_dst, dst)
 		return dst
 
-	try:
-		if tmp_dst.exists():
-			tmp_dst.unlink()
-	except Exception:
-		pass
 	log(f"download_m4a: ffmpeg normalization failed video_id={video_id} src='{src.name}' dst='{dst.name}' rc={rc}")
 	raise DownloadError(f"failed to produce .m4a: {detail}")
 
@@ -918,6 +923,7 @@ def _extractor_args(client: str | None) -> list[str]:
 	return ["--extractor-args", f"youtube:player_client={client}"]
 
 
+@_cleanup_on_failure
 def download_m4a(video_id: str, dst_dir: pathlib.Path, base_name: str, *, yt_dlp_bin: str | None = None, ffmpeg_bin: str | None = None, extra_yt_dlp_args: List[str] | None = None, audio_processing: Dict | None = None) -> pathlib.Path:
 	"""
 	YT Music only. Save using a sanitized stem so our search matches what yt-dlp writes.
@@ -928,8 +934,8 @@ def download_m4a(video_id: str, dst_dir: pathlib.Path, base_name: str, *, yt_dlp
 	dst_dir.mkdir(parents=True, exist_ok=True)
 	safe_base = _safe(base_name)
 
-	# Force yt-dlp to use our sanitized basename
-	out_tpl = str(dst_dir / (safe_base + ".%(ext)s"))
+	# Stage under ".tmp" so a partial yt-dlp download never carries the final name
+	out_tpl = str(dst_dir / (safe_base + ".tmp.%(ext)s"))
 	_cleanup_outputs(dst_dir, safe_base)
 	# Resolve yt-dlp automatically if not provided
 	yt_bin = yt_dlp_bin or ytdlp_path()
@@ -1005,11 +1011,12 @@ def download_m4a(video_id: str, dst_dir: pathlib.Path, base_name: str, *, yt_dlp
 	store_source(result)
 	return result
 
+@_cleanup_on_failure
 def download_opus(video_id: str, dst_dir: pathlib.Path, base_name: str, *, yt_dlp_bin: str | None = None, ffmpeg_bin: str | None = None, extra_yt_dlp_args: List[str] | None = None) -> pathlib.Path:
 	"""Download native Opus audio and remux it into an Ogg Opus container without re-encoding."""
 	dst_dir.mkdir(parents=True, exist_ok=True)
 	safe_base = _safe(base_name)
-	out_tpl = str(dst_dir / (safe_base + ".%(ext)s"))
+	out_tpl = str(dst_dir / (safe_base + ".tmp.%(ext)s"))
 	_cleanup_outputs(dst_dir, safe_base)
 	yt_bin = yt_dlp_bin or ytdlp_path()
 	cookies_args = list(extra_yt_dlp_args or [])
@@ -1043,11 +1050,8 @@ def download_opus(video_id: str, dst_dir: pathlib.Path, base_name: str, *, yt_dl
 		raise DownloadError("downloaded Opus file not found")
 	src = candidates[0]
 	dst = dst_dir / f"{safe_base}.opus"
-	if src == dst:
-		store_source(dst)
-		return dst
 	ffmpeg_bin = ffmpeg_bin or ffmpeg_path()
-	proc = _run_capture([ffmpeg_bin, "-y", "-i", str(src), "-map", "0:a:0", "-c:a", "copy", str(dst)])
+	proc = _encode_to_final([ffmpeg_bin, "-y", "-i", str(src), "-map", "0:a:0", "-c:a", "copy"], dst)
 	detail = _summarize_tool_output(proc.stderr or "", proc.stdout or "")
 	if proc.returncode != 0 or not dst.exists():
 		raise DownloadError(f"ffmpeg Opus remux failed: {detail}")
@@ -1058,6 +1062,7 @@ def download_opus(video_id: str, dst_dir: pathlib.Path, base_name: str, *, yt_dl
 	store_source(dst)
 	return dst
 
+@_cleanup_on_failure
 def download_mp3(video_id: str, dst_dir: pathlib.Path, base_name: str, cbr_320: bool = False, *, yt_dlp_bin: str | None = None, ffmpeg_bin: str | None = None, extra_yt_dlp_args: List[str] | None = None, audio_processing: Dict | None = None, mp3_quality: int = 0, cbr_bitrate_kbps: int | None = None) -> pathlib.Path:
 	dst_dir.mkdir(parents=True, exist_ok=True)
 	safe_base = _safe(base_name)
@@ -1130,8 +1135,7 @@ def download_mp3(video_id: str, dst_dir: pathlib.Path, base_name: str, cbr_320: 
 		args += ["-codec:a","libmp3lame","-b:a","320k"]
 	else:
 		args += ["-codec:a","libmp3lame","-q:a", str(mp3_quality)]
-	args += [str(dst)]
-	proc = _run_capture(args)
+	proc = _encode_to_final(args, dst)
 	rc = proc.returncode
 	detail = _summarize_tool_output(proc.stderr or "", proc.stdout or "")
 	try: src.unlink()
