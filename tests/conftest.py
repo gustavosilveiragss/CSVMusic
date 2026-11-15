@@ -1,4 +1,9 @@
 # tabs only
+import shutil
+import subprocess
+import sys
+import uuid
+
 import pytest
 
 try:
@@ -25,3 +30,26 @@ def qt_application():
 	QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
 	app.processEvents()
 	app.quit()
+
+
+class Sleeper:
+	"""A 30 s sleeper command tagged with a per-test marker, so leftovers are never confused with other runs."""
+
+	def __init__(self) -> None:
+		self.marker = f"csvmusic_sleep_{uuid.uuid4().hex}"
+		self.cmd = [sys.executable, "-c", f"import time; time.sleep(30)  # {self.marker}"]
+
+	def leftovers(self) -> str:
+		return subprocess.run(["pgrep", "-f", self.marker], capture_output=True, text=True).stdout.strip()
+
+	def kill(self) -> None:
+		subprocess.run(["pkill", "-9", "-f", self.marker], capture_output=True)
+
+
+@pytest.fixture
+def sleeper():
+	if shutil.which("pgrep") is None:
+		pytest.skip("pgrep indisponivel")
+	s = Sleeper()
+	yield s
+	s.kill()

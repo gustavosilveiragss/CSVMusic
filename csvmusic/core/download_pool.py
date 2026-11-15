@@ -16,6 +16,8 @@ from .downloader import (
 )
 from .ytmusic_match import RATE_LIMIT_S
 
+MATCH_GAP_S = RATE_LIMIT_S  # floor between two searches; read as download_pool.MATCH_GAP_S so tests can zero it
+
 _PROFILE_CAPS = {
 	YOUTUBE_MITIGATION_NONE.label: 3,
 	YOUTUBE_MITIGATION_LARGE_BATCH.label: 2,
@@ -33,15 +35,11 @@ def concurrency_limit(requested: int, profile: YouTubeMitigationProfile, *, acco
 	return max(1, min(requested, cap))
 
 
-def track_pause_s(profile: YouTubeMitigationProfile, limit: int = 1, *, uniform: Callable[[float, float], float] = random.uniform) -> float:
+def track_pause_s(profile: YouTubeMitigationProfile, *, uniform: Callable[[float, float], float] = random.uniform) -> float:
 	if profile.track_sleep_s <= 0:
-		base = RATE_LIMIT_S
-	else:
-		jitter = min(1.0, profile.track_sleep_s * 0.2)
-		base = max(RATE_LIMIT_S, uniform(profile.track_sleep_s - jitter, profile.track_sleep_s + jitter))
-	if limit <= 1:
-		return base
-	return max(RATE_LIMIT_S, base / limit)
+		return MATCH_GAP_S
+	jitter = min(1.0, profile.track_sleep_s * 0.2)
+	return max(MATCH_GAP_S, uniform(profile.track_sleep_s - jitter, profile.track_sleep_s + jitter))
 
 
 @dataclass(frozen=True)
@@ -80,6 +78,9 @@ class JobContext:
 		self._out.put(JobEvent(self._index, kind, args))
 
 
+_WAKE = object()  # queue marker that cancel() uses to wake a pump that is waiting
+
+
 class _InlineExecutor:
 	"""Runs the job on the caller's thread, so one code path serves both modes."""
 
@@ -91,6 +92,8 @@ class _InlineExecutor:
 
 
 class DownloadPool:
+	"""The pool owns the mitigation profile, the cancel state and every wait of its coordinator."""
+
 	def __init__(self, run: Callable[[Any, JobContext], Any], policy: PoolPolicy, profile: YouTubeMitigationProfile) -> None:
 		self._run = run
 		self._policy = policy
@@ -116,6 +119,11 @@ class DownloadPool:
 		self._executor.shutdown(wait=True)
 
 	@property
+	def profile(self) -> YouTubeMitigationProfile:
+		with self._lock:
+			return self._profile
+
+	@property
 	def limit(self) -> int:
 		return self._limit
 
@@ -128,8 +136,10 @@ class DownloadPool:
 		return self._cancelled
 
 	def submit(self, index: int, item: Any, *, key: Hashable, priority: bool = False) -> bool:
+		# close() stops new tracks but still takes a priority retry of an accepted one (a 429 in flight
+		# when the search aborted must not lose its safe-mode retry); cancel() rejects everything.
 		with self._lock:
-			if self._closed:
+			if self._cancelled or (self._closed and not priority):
 				return False
 			entry = (index, item, key)
 			if priority:
@@ -162,26 +172,31 @@ class DownloadPool:
 			self._closed = True
 
 	def cancel(self) -> None:
+		"""Never blocks the caller (the GUI thread): taskkill is synchronous on Windows, so the kills run on a daemon thread."""
 		with self._lock:
 			self._closed = True
+			first = not self._cancelled
 			self._cancelled = True
 			dropped = list(self._ready)
 			self._ready.clear()
 			for index, item, _key in dropped:
 				self._out.put(Completion(index, item, None, None, True))
-		self._token.cancel()
+			self._out.put(_WAKE)
+		if first:
+			threading.Thread(target=self._token.cancel, daemon=True).start()
 
 	def pump(self, timeout: float) -> list[JobEvent | Completion]:
+		"""Return queued events, waiting up to `timeout` for one even when idle; cancel() wakes the wait."""
 		self._dispatch()
-		out: list[JobEvent | Completion] = []
+		out: list[Any] = []
 		self._drain(out)
-		if not out and self._has_work():
+		if not out and timeout > 0 and not (self._cancelled and not self._has_work()):
 			try:
 				out.append(self._out.get(timeout=timeout))
 			except queue.Empty:
-				return out
+				return []
 			self._drain(out)
-		return [self._collect(msg) for msg in out]
+		return [self._collect(msg) for msg in out if msg is not _WAKE]
 
 	def _has_work(self) -> bool:
 		with self._lock:

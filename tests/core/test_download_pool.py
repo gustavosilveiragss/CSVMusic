@@ -1,5 +1,6 @@
 import sys
 import threading
+import time
 
 import pytest
 
@@ -41,14 +42,13 @@ def test_track_pause_matches_old_formula(profile: YouTubeMitigationProfile) -> N
 		seen.append((lo, hi))
 		return hi
 
-	got = track_pause_s(profile, 1, uniform=uniform)
+	got = track_pause_s(profile, uniform=uniform)
 	if profile.track_sleep_s <= 0:
 		assert got == RATE_LIMIT_S and not seen
 	else:
 		jitter = min(1.0, profile.track_sleep_s * 0.2)
 		assert got == max(RATE_LIMIT_S, profile.track_sleep_s + jitter)
-		assert track_pause_s(profile, 3, uniform=uniform) == max(RATE_LIMIT_S, got / 3)
-	assert track_pause_s(profile, 4, uniform=lambda a, b: 0.0) == RATE_LIMIT_S
+	assert track_pause_s(profile, uniform=lambda a, b: 0.0) == RATE_LIMIT_S
 
 
 def test_concurrency_never_exceeds_limit() -> None:
@@ -120,22 +120,47 @@ def test_busy_key_does_not_dispatch_and_next_free_passes() -> None:
 	assert started["b"].is_set() and sorted(c.item for c in done) == ["a", "b", "c"]
 
 
-def test_submit_after_close_or_cancel_is_false() -> None:
+def test_close_rejects_new_work_but_takes_priority_retry_until_cancel() -> None:
 	with DownloadPool(lambda i, c: i, PoolPolicy(1), N) as pool:
 		pool.close()
 		assert pool.submit(0, 0, key=0) is False
-	with DownloadPool(lambda i, c: i, PoolPolicy(1), N) as pool:
+		assert pool.submit(1, 1, key=1, priority=True) is True
+		assert [c.result for c in collect(pool, 1)] == [1]
 		pool.cancel()
-		assert pool.submit(0, 0, key=0) is False and pool.cancelled
+		assert pool.submit(2, 2, key=2, priority=True) is False and pool.cancelled
+		assert pool.submit(3, 3, key=3) is False
 
 
-def test_cancel_marks_ready_and_kills_in_flight() -> None:
+def test_pool_owns_profile() -> None:
+	with DownloadPool(lambda i, c: i, PoolPolicy(3), N) as pool:
+		assert pool.profile is N
+		pool.apply_profile(A)
+		assert pool.profile is A
+
+
+def test_idle_pump_waits_for_timeout() -> None:
+	with DownloadPool(lambda i, c: i, PoolPolicy(1), N) as pool:
+		started = time.monotonic()
+		assert pool.pump(0.2) == []
+		assert 0.15 <= time.monotonic() - started < 0.6
+
+
+def test_cancel_wakes_idle_pump() -> None:
+	with DownloadPool(lambda i, c: i, PoolPolicy(3), N) as pool:
+		at: list[float] = []
+		threading.Timer(0.1, lambda: (at.append(time.monotonic()), pool.cancel())).start()
+		assert pool.pump(5.0) == []
+		assert time.monotonic() - at[0] < 0.05
+		assert pool.pump(5.0) == [] and pool.idle()
+
+
+def test_cancel_marks_ready_and_kills_in_flight(sleeper) -> None:
 	running = threading.Event()
 
 	def run(item, ctx):
 		if item == "sleep":
 			running.set()
-			downloader._run_capture([sys.executable, "-c", "import time; time.sleep(30)"])
+			downloader._run_capture(sleeper.cmd)
 			raise DownloadCancelled("killed")
 		return item
 
@@ -149,6 +174,30 @@ def test_cancel_marks_ready_and_kills_in_flight() -> None:
 	by_item = {c.item: c for c in done}
 	assert by_item["queued"].cancelled
 	assert by_item["sleep"].cancelled
+	time.sleep(0.2)
+	assert sleeper.leftovers() == ""
+
+
+def test_cancel_never_blocks_and_kills_once(monkeypatch) -> None:
+	release, killed = threading.Event(), []
+
+	def slow_kill(proc) -> None:
+		killed.append(proc)
+		release.wait(1)
+
+	monkeypatch.setattr(downloader, "_kill", slow_kill)
+	with DownloadPool(lambda item, ctx: item, PoolPolicy(1), N) as pool:
+		pool._token.register(object())
+		start = time.monotonic()
+		pool.cancel()
+		pool.cancel()
+		assert time.monotonic() - start < 0.05
+		assert pool.cancelled
+		deadline = time.monotonic() + 3
+		while not killed and time.monotonic() < deadline:
+			time.sleep(0.01)
+		release.set()
+	assert len(killed) == 1
 
 
 def test_base_exception_becomes_error() -> None:
