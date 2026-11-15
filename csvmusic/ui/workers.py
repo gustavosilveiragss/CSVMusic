@@ -17,11 +17,12 @@ from csvmusic.core.url_import import fetch_music_url
 from csvmusic.core.log import log
 from csvmusic.core.timing import timed
 from csvmusic.core.ytmusic_match import find_best, more_candidates, CONFIDENCE_MIN, SearchHealth
-from csvmusic.core.download_pool import track_pause_s
+from csvmusic.core import download_pool
+from csvmusic.core.download_pool import Completion, DownloadPool, JobContext, JobEvent, PoolPolicy, track_pause_s
 from csvmusic.core.downloader import (
 	download_m4a, download_mp3, download_opus, tag_file, yt_thumbnail_bytes, cover_art_url_bytes, write_m3u, sanitize_name,
-	youtube_batch_mitigation, build_ytdlp_mitigation_args, detect_youtube_risk,
-	YOUTUBE_MITIGATION_NONE, YOUTUBE_MITIGATION_AGGRESSIVE, YouTubeMitigationProfile, AgeRestrictedError
+	youtube_batch_mitigation, build_ytdlp_mitigation_args, detect_youtube_risk, detect_concurrency_risk, output_collision_key,
+	YOUTUBE_MITIGATION_AGGRESSIVE, YouTubeMitigationProfile, AgeRestrictedError, DownloadCancelled
 )
 from csvmusic.core.paths import ytdlp_path as _resolve_ytdlp, INTERNAL_YTDLP
 from csvmusic.core.subprocess_env import subprocess_kwargs
@@ -210,9 +211,14 @@ class _BatchState:
 	skipped_count: int = 0
 	processed: int = 0
 	abort_reason: str | None = None
-	done_tracks: List[Dict] = field(default_factory=list)
-	failed_tracks: List[Dict] = field(default_factory=list)
-	skipped_tracks: List[Dict] = field(default_factory=list)
+	next_match_at: float = 0.0
+	# Rows are (csv index, entry): tracks finish out of order, results are reported in CSV order.
+	done_tracks: List[tuple[int, Dict]] = field(default_factory=list)
+	failed_tracks: List[tuple[int, Dict]] = field(default_factory=list)
+	skipped_tracks: List[tuple[int, Dict]] = field(default_factory=list)
+
+	def ordered(self, rows: List[tuple[int, Dict]]) -> List[Dict]:
+		return [entry for _idx, entry in sorted(rows, key=lambda row: row[0])]
 
 
 @dataclass
@@ -275,10 +281,13 @@ class PipelineWorker(QThread):
 		self.m3u_output_dir = pathlib.Path(m3u_output_dir) if m3u_output_dir else None
 		self.row_indices = row_indices or []
 		self._stop = False
-		self._mitigation = YOUTUBE_MITIGATION_NONE
+		self._pool: DownloadPool | None = None
 
 	def stop(self):
 		self._stop = True
+		pool = self._pool
+		if pool is not None:
+			pool.cancel()
 
 	def _download_with_profile(self, vid: str, dest_dir: pathlib.Path, base: str, profile: YouTubeMitigationProfile):
 		from csvmusic.core.downloader import take_download_notices, download_notice_handler
@@ -317,10 +326,10 @@ class PipelineWorker(QThread):
 			processing["volume_gain"] = int(processing.get("volume_gain", 0) or 0) + track_gain
 		return processing
 
-	def _apply_mitigation(self, profile: YouTubeMitigationProfile, reason: str | None = None) -> None:
-		if profile.label == self._mitigation.label:
+	def _apply_mitigation(self, pool: DownloadPool, profile: YouTubeMitigationProfile, reason: str | None = None) -> None:
+		if profile.label == pool.profile.label:
 			return
-		self._mitigation = profile
+		pool.apply_profile(profile)
 		if profile.warning:
 			msg = profile.warning
 			if reason:
@@ -402,14 +411,6 @@ class PipelineWorker(QThread):
 	def _emit(self, kind: str, *args) -> None:
 		{"status": self.sig_row_status, "warning": self.sig_warning, "log": self.sig_log}[kind].emit(*args)
 
-	def _run_job(self, job: "TrackJob") -> "TrackOutcome":
-		outcome = self._process_track(job, self._emit)
-		if outcome.risk_reason:
-			self._apply_mitigation(YOUTUBE_MITIGATION_AGGRESSIVE, outcome.risk_reason)
-			self.sig_row_status.emit(job.row_idx, "Retrying with YouTube safe mode…")
-			outcome = self._process_track(replace(job, profile=YOUTUBE_MITIGATION_AGGRESSIVE, safe_mode=True), self._emit)
-		return outcome
-
 	def _report_quality(self, outcome: "TrackOutcome", title: str) -> None:
 		if outcome.error is not None:
 			return
@@ -441,7 +442,7 @@ class PipelineWorker(QThread):
 				tag_file(fp, job.track, cover if self.embed_art else None, cover_size=_legacy_cover_size(self.legacy_options, embed_art=self.embed_art))
 				chosen = candidate
 				break
-			except AgeRestrictedError:
+			except (AgeRestrictedError, DownloadCancelled):
 				raise
 			except Exception as candidate_exc:
 				last_err = str(candidate_exc)
@@ -449,14 +450,22 @@ class PipelineWorker(QThread):
 			raise RuntimeError(last_err or "Download failed.")
 		return fp, cover, chosen
 
-	def _process_track(self, job: "TrackJob", emit) -> "TrackOutcome":
-		token = _JOB_CONTEXT.set(_JobContext(emit, job.audio_processing))
+	def _process_track(self, job: "TrackJob", ctx: JobContext) -> "TrackOutcome":
+		token = _JOB_CONTEXT.set(_JobContext(ctx.emit, job.audio_processing))
 		try:
-			return self._process_track_in_context(job, emit)
+			started = time.monotonic()
+			ok = False
+			try:
+				outcome = self._process_track_in_context(job, ctx)
+				ok = outcome.error is None
+				return outcome
+			finally:
+				log(f"timing: stage=track seconds={time.monotonic() - started:.1f} row={job.row_idx} ok={ok}")
 		finally:
 			_JOB_CONTEXT.reset(token)
 
-	def _process_track_in_context(self, job: "TrackJob", emit) -> "TrackOutcome":
+	def _process_track_in_context(self, job: "TrackJob", ctx: JobContext) -> "TrackOutcome":
+		emit = ctx.emit
 		payload = _new_payload(job.track, job.options, job.match, job.confidence, job.track_playlist_name, job.forced_match)
 		payload["low_confidence"] = job.low_confidence
 		outcome = TrackOutcome(job.row_idx, payload)
@@ -469,9 +478,11 @@ class PipelineWorker(QThread):
 			outcome.cover = cover
 			payload.update(error=None, downloaded=True, file_path=str(fp), cover_bytes=cover)
 			return outcome
+		except DownloadCancelled:
+			raise
 		except Exception as exc:
 			err = str(exc)
-			risk_reason = detect_youtube_risk(err)
+			risk_reason = (detect_concurrency_risk if ctx.parallel else detect_youtube_risk)(err)
 			if risk_reason and not job.safe_mode and job.profile.label != YOUTUBE_MITIGATION_AGGRESSIVE.label:
 				outcome.risk_reason = risk_reason
 				return outcome
@@ -481,7 +492,7 @@ class PipelineWorker(QThread):
 			payload["error"] = err
 			return outcome
 
-	def _match_track(self, yt, state: "_BatchState", row_idx: int, t: Dict) -> "TrackJob | _MatchSkip | TrackOutcome":
+	def _match_track(self, yt, state: "_BatchState", row_idx: int, t: Dict, profile: YouTubeMitigationProfile) -> "TrackJob | _MatchSkip | TrackOutcome | None":
 		playlist_name = state.playlist_name
 		track_playlist_name = self.playlist or t.get("playlist") or playlist_name
 		dest_dir = self.out_dir / (sanitize_name(track_playlist_name) or "Playlist")
@@ -535,6 +546,8 @@ class PipelineWorker(QThread):
 			reason = search_error or ("No search results" if not options else "No confident match")
 			return _MatchSkip(row_idx, t, payload, status, reason, options, abort_reason)
 
+		if self._stop:
+			return None
 		state.matched += 1
 		self.sig_match_stats.emit(state.matched, state.skipped_count)
 		low_confidence = bool(forced or confidence < CONFIDENCE_MIN)
@@ -544,7 +557,7 @@ class PipelineWorker(QThread):
 				row_idx=row_idx, track=t, match=match, options=options, confidence=confidence,
 				low_confidence=low_confidence, forced_match=forced,
 				candidate_sequence=self._ordered_force_candidates(t, match, options),
-				dest_dir=dest_dir, base=track_filename_base(t), profile=self._mitigation,
+				dest_dir=dest_dir, base=track_filename_base(t), profile=profile,
 				audio_processing=audio_processing, safe_mode=False,
 				playlist_name=playlist_name, track_playlist_name=track_playlist_name,
 			)
@@ -558,15 +571,12 @@ class PipelineWorker(QThread):
 		payload.update(match=match, low_confidence=low_confidence, error=err)
 		return TrackOutcome(row_idx, payload, error=err)
 
-	def _execute_job(self, job: "TrackJob") -> "TrackOutcome":
-		try:
-			return self._run_job(job)
-		except Exception as exc:
-			payload = _new_payload(job.track, job.options, job.match, job.confidence, job.track_playlist_name, job.forced_match)
-			return self._fail_outcome(job.row_idx, job.track, payload, job.match, job.low_confidence, exc, job.playlist_name)
+	def _job_failure(self, job: "TrackJob", exc: BaseException) -> "TrackOutcome":
+		payload = _new_payload(job.track, job.options, job.match, job.confidence, job.track_playlist_name, job.forced_match)
+		return self._fail_outcome(job.row_idx, job.track, payload, job.match, job.low_confidence, exc, job.playlist_name)
 
-	def _record_skip(self, state: "_BatchState", skip: "_MatchSkip") -> None:
-		state.skipped_tracks.append({"track": skip.track, "reason": skip.reason, "options": skip.options})
+	def _record_skip(self, state: "_BatchState", idx: int, skip: "_MatchSkip") -> None:
+		state.skipped_tracks.append((idx, {"track": skip.track, "reason": skip.reason, "options": skip.options}))
 		self.sig_row_status.emit(skip.row_idx, skip.status)
 		state.processed += 1
 		self.sig_progress.emit(state.processed, state.total)
@@ -574,22 +584,104 @@ class PipelineWorker(QThread):
 		state.skipped_count += 1
 		self.sig_match_stats.emit(state.matched, state.skipped_count)
 
-	def _finish_track(self, state: "_BatchState", t: Dict, outcome: "TrackOutcome", started: float) -> None:
+	def _finish_track(self, pool: DownloadPool, state: "_BatchState", idx: int, t: Dict, outcome: "TrackOutcome") -> None:
 		if outcome.error is None:
-			state.done_tracks.append(t)
+			state.done_tracks.append((idx, t))
 		else:
-			state.failed_tracks.append({"track": t, "error": outcome.error})
+			state.failed_tracks.append((idx, {"track": t, "error": outcome.error}))
 		state.processed += 1
 		self.sig_progress.emit(state.processed, state.total)
 		self._report_quality(outcome, t["title"])
-		log(f"timing: stage=track seconds={time.monotonic() - started:.1f} ok={outcome.error is None}")
 		self.sig_track_result.emit(outcome.row_idx, outcome.payload)
+		self._pace(pool, state)
+
+	def _pace(self, pool: DownloadPool, state: "_BatchState", gap: float | None = None) -> None:
+		"""Set the earliest start of the next match; the coordinator waits for it in pool.pump, never in sleep."""
+		if self._stop or state.processed >= state.total:
+			return
+		if gap is None:
+			gap = track_pause_s(pool.profile)
+		state.next_match_at = max(state.next_match_at, time.monotonic() + gap)
+
+	def _retry_in_safe_mode(self, pool: DownloadPool, done: Completion) -> None:
+		job: TrackJob = done.item
+		if not self._stop:
+			self._apply_mitigation(pool, YOUTUBE_MITIGATION_AGGRESSIVE, done.result.risk_reason)
+			self.sig_row_status.emit(job.row_idx, "Retrying with YouTube safe mode…")
+			retry = replace(job, profile=YOUTUBE_MITIGATION_AGGRESSIVE, safe_mode=True)
+			if pool.submit(done.index, retry, key=output_collision_key(job.dest_dir, job.base), priority=True):
+				return
+		self.sig_row_status.emit(job.row_idx, "Stopped")
+
+	def _on_completion(self, pool: DownloadPool, state: "_BatchState", done: Completion) -> None:
+		job: TrackJob = done.item
+		if done.cancelled:
+			self.sig_row_status.emit(job.row_idx, "Stopped")
+			return
+		outcome = self._job_failure(job, done.error) if done.error is not None else done.result
+		if outcome.risk_reason:
+			self._retry_in_safe_mode(pool, done)
+			return
+		self._finish_track(pool, state, done.index, job.track, outcome)
+
+	def _consume(self, pool: DownloadPool, state: "_BatchState", timeout: float = 0.0) -> None:
+		for msg in pool.pump(timeout):
+			if isinstance(msg, JobEvent):
+				self._emit(msg.kind, *msg.args)
+			else:
+				self._on_completion(pool, state, msg)
+
+	def _pool_policy(self) -> PoolPolicy:
+		in_process = False
+		if self.max_workers > 1:
+			try:
+				in_process = (self.yt_dlp_path or _resolve_ytdlp()) == INTERNAL_YTDLP
+			except RuntimeError:
+				pass  # no yt-dlp at all: downloads fail with their own error, it is not the in-process case
+		return PoolPolicy(self.max_workers, bool(self.cookies_file or self.cookies_browser), in_process)
+
+	def _wait_for_slot(self, pool: DownloadPool, state: "_BatchState") -> None:
+		"""Serve the pool until a slot is free and the pacing deadline has passed (stop ends the wait at once)."""
+		self._consume(pool, state)
+		while not self._stop:
+			remaining = state.next_match_at - time.monotonic()
+			if pool.has_capacity() and remaining <= 0:
+				return
+			self._consume(pool, state, min(remaining, 0.2) if remaining > 0 else 0.2)
+
+	def _feed_pool(self, pool: DownloadPool, yt, state: "_BatchState", tracks: List[Dict]) -> None:
+		for idx, track in enumerate(tracks):
+			self._wait_for_slot(pool, state)
+			if self._stop:
+				break
+			row_idx = self.row_indices[idx] if idx < len(self.row_indices) else idx
+			step = self._match_track(yt, state, row_idx, track, pool.job_profile())
+			self._pace(pool, state, download_pool.MATCH_GAP_S)
+			if step is None:
+				self.sig_row_status.emit(row_idx, "Stopped")
+				break
+			if isinstance(step, _MatchSkip):
+				self._record_skip(state, idx, step)
+				if step.abort_reason:
+					state.abort_reason = step.abort_reason
+					self.sig_warning.emit(step.abort_reason)
+					pool.close()
+					break
+				self._pace(pool, state)
+			elif isinstance(step, TrackOutcome):
+				self._finish_track(pool, state, idx, track, step)
+			elif not pool.submit(idx, step, key=output_collision_key(step.dest_dir, step.base)):
+				self.sig_row_status.emit(row_idx, "Stopped")
+				break
+		while not pool.idle():
+			self._consume(pool, state, 0.1)
 
 	def _write_playlists(self, state: "_BatchState") -> None:
-		if state.done_tracks:
+		done_tracks = state.ordered(state.done_tracks)
+		if done_tracks:
 			ext = self.fmt if self.fmt in ("m4a", "mp3", "opus") else "mp3"
 			by_playlist: dict[str, list[dict]] = {}
-			manifest_tracks = self.m3u_tracks_override if self.m3u_tracks_override is not None else state.done_tracks
+			manifest_tracks = self.m3u_tracks_override if self.m3u_tracks_override is not None else done_tracks
 			for completed_track in manifest_tracks:
 				completed_playlist = self.playlist or completed_track.get("playlist") or state.playlist_name
 				expected_file = expected_track_path(completed_track, self.out_dir, ext)
@@ -607,7 +699,7 @@ class PipelineWorker(QThread):
 			msg = "Stopped (partial results saved)."
 		elif state.abort_reason:
 			msg = f"Stopped because search is unavailable. {state.abort_reason}"
-		self.sig_done.emit(msg, state.done_tracks, state.skipped_tracks, state.failed_tracks)
+		self.sig_done.emit(msg, done_tracks, state.ordered(state.skipped_tracks), state.ordered(state.failed_tracks))
 
 	def run(self):
 		try:
@@ -622,9 +714,9 @@ class PipelineWorker(QThread):
 				return
 			total = len(tracks)
 			self.sig_total.emit(total)
-			self._mitigation = youtube_batch_mitigation(total, using_cookies=bool(self.cookies_file or self.cookies_browser))
-			if self._mitigation.warning:
-				self.sig_log.emit(f"[warn] {self._mitigation.warning}")
+			mitigation = youtube_batch_mitigation(total, using_cookies=bool(self.cookies_file or self.cookies_browser))
+			if mitigation.warning:
+				self.sig_log.emit(f"[warn] {mitigation.warning}")
 			self.sig_log.emit("[match] searching on YouTube Music…")
 			self.sig_match_stats.emit(0, 0)
 			try:
@@ -636,27 +728,17 @@ class PipelineWorker(QThread):
 				playlist_name = "Playlist"
 			state = _BatchState(total=total, playlist_name=playlist_name)
 			(self.out_dir / (sanitize_name(playlist_name) or "Playlist")).mkdir(parents=True, exist_ok=True)
-			for idx, track in enumerate(tracks):
-				row_idx = self.row_indices[idx] if idx < len(self.row_indices) else idx
-				if self._stop:
-					break
-				started = time.monotonic()
-				step = self._match_track(yt, state, row_idx, track)
-				if isinstance(step, _MatchSkip):
-					self._record_skip(state, step)
-					if step.abort_reason:
-						state.abort_reason = step.abort_reason
-						self.sig_warning.emit(step.abort_reason)
-						break
-					if not self._stop and idx < total - 1:
-						time.sleep(track_pause_s(self._mitigation))
-					continue
-				outcome = step if isinstance(step, TrackOutcome) else self._execute_job(step)
-				self._finish_track(state, track, outcome, started)
-				if not self._stop and idx < total - 1:
-					with timed("pause"):
-						time.sleep(track_pause_s(self._mitigation))
-				time.sleep(0.02)
+			policy = self._pool_policy()
+			with DownloadPool(self._process_track, policy, mitigation) as pool:
+				self._pool = pool
+				try:
+					if self._stop:  # stop() may have run before the pool existed
+						pool.cancel()
+					if policy.in_process_ytdlp:
+						self.sig_log.emit("Parallel downloads need a standalone yt-dlp; downloading one at a time.")
+					self._feed_pool(pool, yt, state, tracks)
+				finally:
+					self._pool = None
 			self._write_playlists(state)
 		except Exception:
 			self.sig_done.emit("Fatal error:\n" + traceback.format_exc(), [], [], [])

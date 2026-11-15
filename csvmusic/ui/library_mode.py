@@ -3601,7 +3601,7 @@ class LibraryModeDialog(QDialog):
 
 	def _stop_download(self) -> None:
 		if self.download_worker and self.download_worker.isRunning():
-			self.download_activity.setText("Stopping after the current operation...")
+			self.download_activity.setText("Stopping…")
 			self.download_worker.stop()
 
 	def _use_in_csvmusic(self) -> None:
