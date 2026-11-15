@@ -608,6 +608,16 @@ def _filename_starts_with_base(filename: str, base: str) -> bool:
 			return True
 	return False
 
+def output_collision_key(dst_dir: pathlib.Path, base_name: str) -> tuple[str, str]:
+	"""Tracks with equal keys must not download at the same time.
+
+	_cleanup_outputs and _list_downloads match files by the "<base>." prefix, so "Song" would
+	delete the staging file of "Song.feat X"; the key therefore stops at the first dot. Case
+	and Unicode form are folded because Windows and macOS filesystems do not tell them apart."""
+	stem = unicodedata.normalize("NFKC", _safe(base_name)).casefold().split(".")[0]
+	return str(dst_dir), stem
+
+
 def _list_downloads(dir: pathlib.Path, base: str) -> list[pathlib.Path]:
 	# Find files that start with our sanitized base, allowing Unicode normalization differences.
 	return sorted(
