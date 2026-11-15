@@ -57,7 +57,6 @@ def test_public_failure_is_bounded(monkeypatch):
 
 @pytest.mark.parametrize("error", [
 	"ERROR: unable to download video data: HTTP Error 403: Forbidden",
-	"Sign in to confirm you're not a bot",
 	"Sign in to confirm your age",
 	"signature solving failed",
 ])
@@ -104,3 +103,9 @@ def test_huge_batch_warning_does_not_claim_detected_rate_limit():
 	assert profile.active
 	assert profile.reason == "large playlist size"
 	assert "precaution" in profile.warning
+
+
+@pytest.mark.parametrize("using_cookies", [False, True])
+def test_bot_check_is_a_risk_signal_like_a_rate_limit(using_cookies):
+	detail = downloader._summarize_tool_output("Sign in to confirm you're not a bot", "", using_cookies=using_cookies)
+	assert downloader.detect_youtube_risk(detail) == "YouTube bot check"

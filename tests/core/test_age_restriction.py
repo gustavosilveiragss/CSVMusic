@@ -56,3 +56,49 @@ def test_age_restriction_stops_fallbacks_without_losing_guidance(monkeypatch, tm
 def test_successful_download_ignores_age_warning(monkeypatch):
 	monkeypatch.setattr(downloader, "_run_ytdlp_module", lambda args: (0, "", "WARNING: age-restricted"))
 	assert downloader._run_ytdlp_detail([downloader.INTERNAL_YTDLP, "url"]) == (0, "")
+
+
+@pytest.mark.parametrize("message, expected", [
+	("ERROR: Sign in to confirm your age", True),
+	("ERROR: Private video. Sign in if you have access", True),
+	("ERROR: This video is available to this channel's members only. Join this channel", True),
+	("ERROR: Members-only content", True),
+	("ERROR: [youtube] LOGIN_REQUIRED", True),
+	("ERROR: Sign in to confirm you're not a bot", False),
+	("ERROR: Sign in to confirm you’re not a bot", False),
+	("YouTube asked for bot verification.", False),
+	("ERROR: Requested format is not available", False),
+	("ERROR: Sign in if you've been granted access to this video", True),
+	("ERROR: Sign in if you’ve been granted access to this video", True),
+	("ERROR: login required", True),
+	("ERROR: This video is not available in your country. Sign in", False),
+	("ERROR: This video is not available on this app. Please sign in", False),
+	("ERROR: HTTP Error 429: Too Many Requests. Sign in to continue", False),
+	("ERROR: HTTP Error 429 login required", False),
+	("ERROR: Private video; too many requests", False),
+])
+def test_one_classifier_for_needs_the_account(message, expected):
+	assert downloader.is_auth_required_error(message) is expected
+	assert issubclass(downloader.AgeRestrictedError, downloader.AuthRequiredError)
+
+
+def test_auth_escalation_raises_only_inside_the_scope(monkeypatch):
+	calls = []
+	def fail(args):
+		calls.append(args)
+		return 1, "", "ERROR: Private video. Sign in if you have access"
+	monkeypatch.setattr(downloader, "_run_ytdlp_module", fail)
+	cmd = [downloader.INTERNAL_YTDLP, "url"]
+	rc, _detail = downloader._run_ytdlp_detail(cmd)
+	assert rc == 1
+	with downloader.auth_escalation():
+		with pytest.raises(downloader.AuthRequiredError) as error:
+			downloader._run_ytdlp_detail(cmd)
+	assert "Settings > YouTube Account" in str(error.value)
+	assert downloader._run_ytdlp_detail(cmd)[0] == 1  # scope is gone
+
+
+def test_auth_escalation_ignores_bot_checks(monkeypatch):
+	monkeypatch.setattr(downloader, "_run_ytdlp_module", lambda args: (1, "", "ERROR: Sign in to confirm you're not a bot"))
+	with downloader.auth_escalation():
+		assert downloader._run_ytdlp_detail([downloader.INTERNAL_YTDLP, "url"])[0] == 1

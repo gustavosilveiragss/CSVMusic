@@ -22,8 +22,9 @@ from csvmusic.core import download_pool
 from csvmusic.core.download_pool import Completion, DownloadPool, JobContext, JobEvent, PoolPolicy, track_pause_s
 from csvmusic.core.downloader import (
 	download_m4a, download_mp3, download_opus, tag_file, yt_thumbnail_bytes, cover_art_url_bytes, write_m3u, sanitize_name,
-	youtube_batch_mitigation, build_ytdlp_mitigation_args, detect_youtube_risk, detect_concurrency_risk, output_collision_key,
-	YOUTUBE_MITIGATION_AGGRESSIVE, YouTubeMitigationProfile, AgeRestrictedError, DownloadCancelled
+	youtube_batch_mitigation, build_ytdlp_mitigation_args, detect_youtube_risk, output_collision_key,
+	YOUTUBE_MITIGATION_AGGRESSIVE, YouTubeMitigationProfile, AuthRequiredError, DownloadCancelled,
+	ACCOUNT_LANE, ACCOUNT_LANE_LIMIT, auth_escalation
 )
 from csvmusic.core.paths import ytdlp_path as _resolve_ytdlp, INTERNAL_YTDLP
 from csvmusic.core.subprocess_env import subprocess_kwargs
@@ -163,6 +164,10 @@ def _new_payload(track: Dict, options: List[Dict], match: Dict | None, confidenc
 	}
 
 
+AUTH_ANON = "anon"
+AUTH_ACCOUNT = ACCOUNT_LANE  # the account is also the pool lane that paces it
+
+
 @dataclass(frozen=True)
 class TrackJob:
 	row_idx: int
@@ -180,12 +185,22 @@ class TrackJob:
 	safe_mode: bool
 	playlist_name: str
 	track_playlist_name: str
+	auth: str = AUTH_ANON  # AUTH_ANON | AUTH_ACCOUNT: only the coordinator moves a job to the account
 
 
 @dataclass(frozen=True)
 class _JobContext:
 	emit: Callable[..., None]
 	audio_processing: Dict
+	auth: str
+
+
+class _NeedsAccount(Exception):
+	"""An anonymous attempt needs the account (age, private, members-only); index is the candidate to resume from."""
+
+	def __init__(self, index: int) -> None:
+		super().__init__("account required")
+		self.index = index
 
 
 # Per-job state read by the download helpers, so jobs never share mutable worker attributes.
@@ -230,6 +245,7 @@ class TrackOutcome:
 	cover: bytes | None = None
 	error: str | None = None
 	risk_reason: str | None = None
+	account_from: int | None = None  # candidate index to retry with the account (age restriction)
 
 
 class PipelineWorker(QThread):
@@ -302,16 +318,24 @@ class PipelineWorker(QThread):
 	def _download_with_profile_impl(self, vid: str, dest_dir: pathlib.Path, base: str, profile: YouTubeMitigationProfile):
 		audio_processing = self._job_context().audio_processing
 		extra_args: list[str] = []
-		if self.cookies_file:
-			extra_args += ["--cookies", self.cookies_file]
-		elif self.cookies_browser:
-			extra_args += ["--cookies-from-browser", self.cookies_browser]
+		if self._job_context().auth == AUTH_ACCOUNT:
+			if self.cookies_file:
+				extra_args += ["--cookies", self.cookies_file]
+			elif self.cookies_browser:
+				extra_args += ["--cookies-from-browser", self.cookies_browser]
+		elif self._account_available:
+			# A yt-dlp config file with cookies must not authenticate the anonymous attempt.
+			extra_args += ["--no-cookies", "--no-cookies-from-browser"]
 		extra_args += build_ytdlp_mitigation_args(profile)
 		if self.fmt == "m4a":
 			return download_m4a(vid, dest_dir, base, yt_dlp_bin=self.yt_dlp_path, ffmpeg_bin=self.ffmpeg_path_override, extra_yt_dlp_args=extra_args or None, audio_processing=audio_processing)
 		if self.fmt == "opus":
 			return download_opus(vid, dest_dir, base, yt_dlp_bin=self.yt_dlp_path, ffmpeg_bin=self.ffmpeg_path_override, extra_yt_dlp_args=extra_args or None)
 		return download_mp3(vid, dest_dir, base, yt_dlp_bin=self.yt_dlp_path, ffmpeg_bin=self.ffmpeg_path_override, extra_yt_dlp_args=extra_args or None, audio_processing=audio_processing, mp3_quality=self.mp3_quality, cbr_bitrate_kbps=_legacy_cbr_bitrate(self.legacy_options))
+
+	@property
+	def _account_available(self) -> bool:
+		return bool(self.cookies_file or self.cookies_browser)
 
 	def _job_context(self) -> _JobContext:
 		ctx = _JOB_CONTEXT.get()
@@ -423,7 +447,7 @@ class PipelineWorker(QThread):
 			self._emit("status", outcome.row_idx, "Downloaded — low quality")
 
 	def _try_candidates(self, job: "TrackJob", emit):
-		stage = (lambda _name: nullcontext()) if job.safe_mode else timed
+		stage = (lambda _name, **_fields: nullcontext()) if job.safe_mode else timed
 		sequence = job.candidate_sequence
 		fallback_attempts = self.force_download and len(sequence) > 1
 		last_err = None
@@ -435,7 +459,7 @@ class PipelineWorker(QThread):
 			if fallback_attempts:
 				emit("status", job.row_idx, self._attempt_status_text(candidate, attempt_idx, len(sequence), safe_mode=job.safe_mode))
 			try:
-				with stage("download"):
+				with stage("download", auth=job.auth):
 					fp = self._download_with_profile(vid, job.dest_dir, job.base, job.profile)
 				emit("status", job.row_idx, "Tagging…")
 				with stage("cover"):
@@ -443,7 +467,11 @@ class PipelineWorker(QThread):
 				tag_file(fp, job.track, cover if self.embed_art else None, cover_size=_legacy_cover_size(self.legacy_options, embed_art=self.embed_art))
 				chosen = candidate
 				break
-			except (AgeRestrictedError, DownloadCancelled):
+			except AuthRequiredError:
+				if job.auth == AUTH_ANON and self._account_available:
+					raise _NeedsAccount(attempt_idx - 1)
+				raise
+			except DownloadCancelled:
 				raise
 			except Exception as candidate_exc:
 				last_err = str(candidate_exc)
@@ -452,16 +480,19 @@ class PipelineWorker(QThread):
 		return fp, cover, chosen
 
 	def _process_track(self, job: "TrackJob", ctx: JobContext) -> "TrackOutcome":
-		token = _JOB_CONTEXT.set(_JobContext(ctx.emit, job.audio_processing))
+		token = _JOB_CONTEXT.set(_JobContext(ctx.emit, job.audio_processing, job.auth))
+		# The anonymous attempt of a job that has an account to fall back on: auth failures end it at once.
+		escalate = auth_escalation() if job.auth == AUTH_ANON and self._account_available else nullcontext()
 		try:
 			started = time.monotonic()
 			ok = False
 			try:
-				outcome = self._process_track_in_context(job, ctx)
+				with escalate:
+					outcome = self._process_track_in_context(job, ctx)
 				ok = outcome.error is None
 				return outcome
 			finally:
-				log(f"timing: stage=track seconds={time.monotonic() - started:.1f} row={job.row_idx} ok={ok}")
+				log(f"timing: stage=track seconds={time.monotonic() - started:.1f} row={job.row_idx} ok={ok} auth={job.auth}")
 		finally:
 			_JOB_CONTEXT.reset(token)
 
@@ -481,9 +512,12 @@ class PipelineWorker(QThread):
 			return outcome
 		except DownloadCancelled:
 			raise
+		except _NeedsAccount as need:
+			outcome.account_from = need.index
+			return outcome
 		except Exception as exc:
 			err = str(exc)
-			risk_reason = (detect_concurrency_risk if ctx.parallel else detect_youtube_risk)(err)
+			risk_reason = detect_youtube_risk(err)
 			if risk_reason and not job.safe_mode and job.profile.label != YOUTUBE_MITIGATION_AGGRESSIVE.label:
 				outcome.risk_reason = risk_reason
 				return outcome
@@ -604,15 +638,37 @@ class PipelineWorker(QThread):
 			gap = track_pause_s(pool.profile)
 		state.next_match_at = max(state.next_match_at, time.monotonic() + gap)
 
-	def _retry_in_safe_mode(self, pool: DownloadPool, done: Completion) -> None:
+	@staticmethod
+	def _lane(job: TrackJob) -> str | None:
+		return ACCOUNT_LANE if job.auth == AUTH_ACCOUNT else None
+
+	def _resubmit(self, pool: DownloadPool, done: Completion, *, auth: str, safe_mode: bool, status: str, candidate_sequence: List[Dict] | None = None) -> None:
+		"""The only way a finished job runs again: same row, new auth/mode, ahead of the queue."""
 		job: TrackJob = done.item
 		if not self._stop:
-			self._apply_mitigation(pool, YOUTUBE_MITIGATION_AGGRESSIVE, done.result.risk_reason)
-			self.sig_row_status.emit(job.row_idx, "Retrying with YouTube safe mode…")
-			retry = replace(job, profile=YOUTUBE_MITIGATION_AGGRESSIVE, safe_mode=True)
-			if pool.submit(done.index, retry, key=output_collision_key(job.dest_dir, job.base), priority=True):
+			self.sig_row_status.emit(job.row_idx, status)
+			retry = replace(
+				job, auth=auth, safe_mode=safe_mode,
+				profile=YOUTUBE_MITIGATION_AGGRESSIVE if safe_mode else job.profile,
+				candidate_sequence=job.candidate_sequence if candidate_sequence is None else candidate_sequence,
+			)
+			if pool.submit(done.index, retry, key=output_collision_key(job.dest_dir, job.base), priority=True, lane=self._lane(retry)):
 				return
 		self.sig_row_status.emit(job.row_idx, "Stopped")
+
+	def _retry_in_safe_mode(self, pool: DownloadPool, done: Completion) -> None:
+		if not self._stop:
+			self._apply_mitigation(pool, YOUTUBE_MITIGATION_AGGRESSIVE, done.result.risk_reason)
+		# Safe mode keeps the login's benefit against bot checks, at the account lane's minimal pace.
+		auth = AUTH_ACCOUNT if self._account_available else AUTH_ANON
+		self._resubmit(pool, done, auth=auth, safe_mode=True, status="Retrying with YouTube safe mode…")
+
+	def _retry_with_account(self, pool: DownloadPool, done: Completion) -> None:
+		job: TrackJob = done.item
+		self._resubmit(
+			pool, done, auth=AUTH_ACCOUNT, safe_mode=job.safe_mode, status="Needs sign-in: retrying with your YouTube account…",
+			candidate_sequence=job.candidate_sequence[done.result.account_from:],
+		)
 
 	def _on_completion(self, pool: DownloadPool, state: "_BatchState", done: Completion) -> None:
 		job: TrackJob = done.item
@@ -623,7 +679,12 @@ class PipelineWorker(QThread):
 		if outcome.risk_reason:
 			self._retry_in_safe_mode(pool, done)
 			return
+		if outcome.account_from is not None:
+			self._retry_with_account(pool, done)
+			return
 		self._finish_track(pool, state, done.index, job.track, outcome)
+		if outcome.error is None:
+			pool.track_done()  # throughput = tracks downloaded; retries, escalations and failures are not samples
 
 	def _consume(self, pool: DownloadPool, state: "_BatchState", timeout: float = 0.0) -> None:
 		for msg in pool.pump(timeout):
@@ -639,7 +700,8 @@ class PipelineWorker(QThread):
 				in_process = (self.yt_dlp_path or _resolve_ytdlp()) == INTERNAL_YTDLP
 			except RuntimeError:
 				pass  # no yt-dlp at all: downloads fail with their own error, it is not the in-process case
-		return PoolPolicy(self.max_workers, bool(self.cookies_file or self.cookies_browser), in_process, os.cpu_count())
+		lanes = {ACCOUNT_LANE: ACCOUNT_LANE_LIMIT} if self._account_available else {}
+		return PoolPolicy(self.max_workers, in_process, os.cpu_count(), lanes)
 
 	def _wait_for_slot(self, pool: DownloadPool, state: "_BatchState") -> None:
 		"""Serve the pool until a slot is free and the pacing deadline has passed (stop ends the wait at once)."""

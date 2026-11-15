@@ -21,20 +21,17 @@ from .ytmusic_match import RATE_LIMIT_S
 
 MATCH_GAP_S = RATE_LIMIT_S  # floor between two searches; read as download_pool.MATCH_GAP_S so tests can zero it
 
-_ACCOUNT_COOKIES_CAP = 2
 _MAX_REQUESTED = 8
 
 
 def concurrency_limit(
-	requested: int | None, profile: YouTubeMitigationProfile, *, account_cookies: bool, in_process_ytdlp: bool,
+	requested: int | None, profile: YouTubeMitigationProfile, *, in_process_ytdlp: bool,
 	cpu_count: int | None,
 ) -> int:
 	"""Hard ceiling for the adaptive controller; the pacer, not this cap, rate-limits requests."""
 	if in_process_ytdlp or profile.label == YOUTUBE_MITIGATION_AGGRESSIVE.label:
 		return 1
 	cap = hard_cap(cpu_count) if requested is None else max(1, min(requested, _MAX_REQUESTED))
-	if account_cookies:
-		cap = min(cap, _ACCOUNT_COOKIES_CAP)
 	return cap
 
 
@@ -48,13 +45,12 @@ def track_pause_s(profile: YouTubeMitigationProfile, *, uniform: Callable[[float
 @dataclass(frozen=True)
 class PoolPolicy:
 	requested: int | None
-	account_cookies: bool = False
 	in_process_ytdlp: bool = False
 	cpu_count: int | None = None
 	lane_limits: Mapping[str, int] = field(default_factory=dict)  # per-lane ceiling; a lane absent here is uncapped
 
 	def max_limit(self, profile: YouTubeMitigationProfile) -> int:
-		return concurrency_limit(self.requested, profile, account_cookies=self.account_cookies, in_process_ytdlp=self.in_process_ytdlp, cpu_count=self.cpu_count)
+		return concurrency_limit(self.requested, profile, in_process_ytdlp=self.in_process_ytdlp, cpu_count=self.cpu_count)
 
 
 @dataclass(frozen=True)
@@ -164,7 +160,21 @@ class DownloadPool:
 
 	def has_capacity(self) -> bool:
 		with self._lock:
-			return not self._closed and len(self._in_flight) + len(self._ready) < self._adaptive.level
+			return not self._closed and len(self._in_flight) + self._dispatchable_ready() < self._adaptive.level
+
+	def _dispatchable_ready(self) -> int:
+		"""Invariant: a ready entry held back only by its full lane occupies no pool capacity. Caller holds the lock."""
+		limits = self._policy.lane_limits
+		room = {lane: limit - sum(1 for _k, l in self._in_flight.values() if l == lane) for lane, limit in limits.items()}
+		count = 0
+		for entry in self._ready:
+			lane = entry[3]
+			if lane in room:
+				if room[lane] <= 0:
+					continue
+				room[lane] -= 1
+			count += 1
+		return count
 
 	def idle(self) -> bool:
 		with self._lock:
@@ -227,11 +237,14 @@ class DownloadPool:
 		if isinstance(msg, Completion):
 			with self._lock:
 				self._in_flight.pop(msg.index, None)
-				# Jobs that failed fast still count, which inflates throughput; accepted bias.
-				action = None if msg.cancelled else self._adaptive.on_completion()
-				if action:
-					log(f"concurrency: {self._adaptive.describe()} action={action}")
 		return msg
+
+	def track_done(self) -> None:
+		"""The coordinator calls this once per track downloaded successfully: that is the controller's throughput unit."""
+		with self._lock:
+			action = self._adaptive.on_completion()
+			if action:
+				log(f"concurrency: {self._adaptive.describe()} action={action}")
 
 	def _dispatch(self) -> None:
 		while True:
@@ -251,7 +264,7 @@ class DownloadPool:
 
 	def _job(self, index: int, item: Any, lane: str | None) -> None:
 		ctx = JobContext(index, self._out, self._parallel)
-		# Lane pacer first so a job waiting on its lane gap holds no global slot.
+		# Lane pacer first: a job waiting on its lane gap occupies a thread and an in-flight slot but not the global pacer's turn.
 		lane_pacer = self._lane_pacers.get(lane) if lane is not None else None
 		pacer = (lane_pacer, self._pacer) if lane_pacer is not None and self._pacer is not None else self._pacer
 		try:

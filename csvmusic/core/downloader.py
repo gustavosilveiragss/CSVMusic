@@ -51,6 +51,8 @@ def download_notice_handler(callback: Callable[[str], None]):
 
 
 _YOUTUBE_RISK_PATTERNS: tuple[tuple[str, str], ...] = (
+	("not a bot", "YouTube bot check"),
+	("bot verification", "YouTube bot check"),
 	("http error 429", "YouTube returned HTTP 429"),
 	("too many requests", "YouTube is rate limiting requests"),
 	("this content isn't available, try again later", "YouTube temporarily blocked the session"),
@@ -182,8 +184,44 @@ def _pace_ytdlp() -> None:
 		each.acquire()
 
 
-class AgeRestrictedError(DownloadError):
-	"""The selected video needs an eligible authenticated YouTube session."""
+class AuthRequiredError(DownloadError):
+	"""The selected video needs the user's signed-in YouTube account."""
+
+
+class AgeRestrictedError(AuthRequiredError):
+	"""Age is one kind of "needs an account"."""
+
+
+_auth_scope = threading.local()
+
+
+@contextlib.contextmanager
+def auth_escalation():
+	"""Anonymous attempt of a job that has an account to fall back on: auth-required failures raise at once."""
+	previous = getattr(_auth_scope, "active", False)
+	_auth_scope.active = True
+	try:
+		yield
+	finally:
+		_auth_scope.active = previous
+
+
+_PRIVATE_MARKERS = ("private video", "members-only", "members only", "join this channel", "sign in if you've been granted access")
+_LOGIN_MARKERS = ("login required", "login_required")
+
+
+def _has_marker(text: str, markers: tuple[str, ...]) -> bool:
+	return any(marker in text for marker in markers)
+
+
+def is_auth_required_error(message: str) -> bool:
+	"""The single rule for "only the account can get this video"; a rate limit or bot check is never one."""
+	if detect_youtube_risk(message):
+		return False
+	if is_age_restriction_error(message):
+		return True
+	text = message.lower().replace("\u2019", "'")
+	return _has_marker(text, _PRIVATE_MARKERS + _LOGIN_MARKERS)
 
 
 def is_age_restriction_error(message: str) -> bool:
@@ -195,14 +233,18 @@ def is_age_restriction_error(message: str) -> bool:
 
 
 def age_restriction_message(*, using_cookies: bool) -> str:
+	return auth_required_message("Age-restricted video.", using_cookies=using_cookies)
+
+
+def auth_required_message(subject: str = "Account access required.", *, using_cookies: bool) -> str:
 	if using_cookies:
 		return (
-			"Age-restricted video. Cookies were used, but YouTube still rejected this result. "
+			f"{subject} Cookies were used, but YouTube still rejected this result. "
 			"Open Settings > YouTube Account, reconnect or refresh your cookies, and test the connection. "
 			"Check that this account can play the video on YouTube, then retry or choose another result."
 		)
 	return (
-		"Age-restricted video. Enable cookies in Settings > YouTube Account. "
+		f"{subject} Enable cookies in Settings > YouTube Account. "
 		"Sign in, enable 'Use this YouTube session for downloads', press Save, then retry. "
 		"Cookies can allow access when your account is eligible to watch the video on YouTube."
 	)
@@ -260,12 +302,14 @@ _PACER_GAPS = {
 }
 
 
+ACCOUNT_LANE = "account"
+ACCOUNT_LANE_LIMIT = 2
 ACCOUNT_LANE_GAP = (8.0, 2.0)  # hypothesis, to be calibrated
 
 
 def lane_pacer_gap(lane: str) -> tuple[float, float] | None:
 	"""(min_gap_s, jitter_s) of a lane's own pacer; None when the lane has no pacer."""
-	return ACCOUNT_LANE_GAP if lane == "account" else None
+	return ACCOUNT_LANE_GAP if lane == ACCOUNT_LANE else None
 
 
 def pacer_gap_for_profile(profile: YouTubeMitigationProfile) -> tuple[float, float]:
@@ -396,9 +440,9 @@ def _summarize_tool_output(stderr: str, stdout: str, *, using_cookies: bool = Fa
 		return "yt-dlp could not solve the YouTube player challenge. Install Deno 2.3+ or Node 22+, then update yt-dlp with the default extras."
 	if "requested format is not available" in lower_full:
 		return "Requested audio format is not available for this result."
-	if "private video" in lower_full or "members-only" in lower_full or "members only" in lower_full:
-		return "Account access required. Check that your signed-in YouTube account can play this private or members-only video, or choose another result."
-	if "login required" in lower_full or "login_required" in lower_full:
+	if _has_marker(lower_full, _PRIVATE_MARKERS):
+		return auth_required_message(using_cookies=using_cookies)
+	if _has_marker(lower_full, _LOGIN_MARKERS):
 		return "YouTube sign-in required. Reconnect in Settings > YouTube Account and test the session."
 	if "http error 403" in lower_full:
 		return (
@@ -442,21 +486,11 @@ def youtube_risk_acknowledgement(profile: YouTubeMitigationProfile) -> str | Non
 
 
 def detect_youtube_risk(detail: str) -> str | None:
-	text = (detail or "").lower()
+	text = (detail or "").lower().replace("\u2019", "'")
 	for pattern, reason in _YOUTUBE_RISK_PATTERNS:
 		if pattern in text:
 			return reason
 	return None
-
-
-_BOT_CHECK_PATTERNS = ("not a bot", "bot verification")
-
-
-def detect_concurrency_risk(detail: str) -> str | None:
-	text = (detail or "").lower().replace("\u2019", "'")
-	if any(pattern in text for pattern in _BOT_CHECK_PATTERNS):
-		return "YouTube bot check"
-	return detect_youtube_risk(detail)
 
 
 def build_ytdlp_mitigation_args(profile: YouTubeMitigationProfile | None) -> list[str]:
@@ -545,10 +579,8 @@ def _run_ytdlp_detail(cmd: list[str]) -> tuple[int, str]:
 		_cmd_uses_cookies(cmd)
 		and "unable to download video data: http error 403" in raw_error
 		and not is_age_restriction_error(raw_error)
-		and not any(marker in raw_error for marker in (
-			"sign in", "login required", "login_required", "private video",
-			"members-only", "members only", "http error 429", "too many requests",
-		))
+		and not is_auth_required_error(raw_error)
+		and not detect_youtube_risk(raw_error)
 	):
 		_download_notice("Signed-in YouTube media request returned HTTP 403. Retrying this video once without cookies; saved account settings are unchanged.")
 		public_cmd = _strip_cookie_args(cmd) + ["--ignore-config", "--no-cookies", "--no-cookies-from-browser", "--no-continue"]
@@ -575,6 +607,8 @@ def _run_ytdlp_detail(cmd: list[str]) -> tuple[int, str]:
 		# Preserve the actionable error instead of masking it with later client,
 		# format, or search failures (or downloading a different video).
 		raise AgeRestrictedError(detail)
+	if getattr(_auth_scope, "active", False) and is_auth_required_error(raw_error):
+		raise AuthRequiredError(auth_required_message(using_cookies=False))
 	return rc, detail
 
 

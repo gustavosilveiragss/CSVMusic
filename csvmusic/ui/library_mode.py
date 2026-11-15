@@ -994,7 +994,7 @@ class LibrarySettingsDialog(QDialog):
 			"3. Export youtube.com cookies in Netscape format using a trusted extension from the yt-dlp guide below. Close the private window and do not reuse that session.\n"
 			"4. Choose the exported file in Settings, check it, and save. The file takes priority over browser extraction, avoiding browser database locks and decryption errors.\n\n"
 			"Cookies grant access to your account: keep the file private, never upload it or include it in reports. Account use can trigger restrictions.\n\n"
-			"An eligible account may access age-restricted content; cookies do not bypass age verification. Premium formats depend on YouTube and yt-dlp availability. Downloads will not silently retry without your cookies."
+			"Downloads first try without your account; your cookies are used only when YouTube requires sign-in (age-restricted, private or members-only videos). Premium-only formats need the account and may not be used."
 		)
 		instructions.setWordWrap(True)
 		layout.addWidget(instructions)

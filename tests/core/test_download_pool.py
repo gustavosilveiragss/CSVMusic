@@ -24,8 +24,8 @@ def collect(pool: DownloadPool, count: int) -> list[Completion]:
 	return done
 
 
-def _limit(requested, profile=N, *, cookies=False, in_process=False, cpus=4) -> int:
-	return concurrency_limit(requested, profile, account_cookies=cookies, in_process_ytdlp=in_process, cpu_count=cpus)
+def _limit(requested, profile=N, *, in_process=False, cpus=4) -> int:
+	return concurrency_limit(requested, profile, in_process_ytdlp=in_process, cpu_count=cpus)
 
 
 def test_limit_table() -> None:
@@ -38,8 +38,6 @@ def test_limit_table() -> None:
 	for requested in (None, 1, 5):
 		assert _limit(requested, A) == 1
 		assert _limit(requested, N, in_process=True) == 1
-		assert _limit(requested, N, cookies=True) == min(2, _limit(requested, N))
-	assert _limit(None, N, cookies=True, cpus=12) == 2
 
 
 @pytest.mark.parametrize("profile", [N, L, A])
@@ -318,7 +316,10 @@ def test_adaptive_limit_climbs_and_gates_in_flight(monkeypatch) -> None:
 				pool.submit(phase * 100 + i, (lim, i), key=phase * 100 + i)
 			done: list[Completion] = []
 			while True:
-				done += [m for m in pool.pump(0.05) if isinstance(m, Completion)]
+				got = [m for m in pool.pump(0.05) if isinstance(m, Completion)]
+				for _ in got:
+					pool.track_done()
+				done += got
 				with lock:
 					if state["cur"] == lim:
 						release.set()
@@ -350,7 +351,7 @@ def test_apply_profile_ceiling_one_drops_limit_now(monkeypatch) -> None:
 		assert pool.has_capacity()
 
 
-def test_cancelled_completions_do_not_feed_controller(monkeypatch) -> None:
+def test_completions_do_not_feed_controller_only_track_done_does(monkeypatch) -> None:
 	logs: list[str] = []
 	pool = _adaptive_pool(monkeypatch, logs)
 	calls: list[int] = []
@@ -359,10 +360,10 @@ def test_cancelled_completions_do_not_feed_controller(monkeypatch) -> None:
 	with pool:
 		for i in range(5):
 			pool.submit(i, i, key=i)
-		pool.cancel()
-		got = [m for m in pool.pump(0.2) if isinstance(m, Completion)]
-		assert len(got) == 5 and all(c.cancelled for c in got)
-		assert pool.limit == 3 and not calls and not logs
+		collect(pool, 5)
+		assert not calls
+		pool.track_done()
+		assert calls == [1]
 
 
 def test_inline_has_no_active_controller() -> None:
@@ -410,6 +411,34 @@ def test_lane_limit_never_exceeded_and_anonymous_keep_going(monkeypatch) -> None
 		release.set()
 		done = collect(pool, 7)
 	assert len(done) == 7 and state["max"] == 2
+
+
+def test_parked_lane_entries_do_not_consume_pool_capacity(monkeypatch) -> None:
+	release = threading.Event()
+	anon = threading.Event()
+
+	def run(item, ctx):
+		if item == "anon":
+			anon.set()
+			return item
+		release.wait(5)
+		return item
+
+	with _lane_pool(run, requested=6, monkeypatch=monkeypatch) as pool:
+		pool._adaptive._level = 6
+		for i in range(8):
+			pool.submit(i, "acc", key=i, lane="account")
+		pool._dispatch()
+		assert len(pool._in_flight) == 2 and len(pool._ready) == 6
+		assert pool.has_capacity()
+		for i in range(10, 14):
+			assert pool.has_capacity()
+			pool.submit(i, "anon", key=i)
+			pool._dispatch()
+		assert anon.wait(5)
+		assert not pool.has_capacity()  # 2 lane jobs + 4 anonymous in flight = level
+		release.set()
+		collect(pool, 12)
 
 
 def test_full_lane_does_not_block_following_entries(monkeypatch) -> None:
@@ -466,7 +495,7 @@ def test_cancel_drops_ready_lane_entries(monkeypatch) -> None:
 		for i in range(4):
 			pool.submit(i, i, key=i, lane="account")
 		pool.pump(0)
-		assert not pool.idle() and not pool.has_capacity()
+		assert not pool.idle() and pool.has_capacity()  # parked lane entries take no capacity
 		pool.cancel()
 		release.set()
 		done = collect(pool, 4)
@@ -498,3 +527,14 @@ def test_inline_ignores_lane_pacers_and_limits() -> None:
 		pool.submit(0, 0, key=0, lane="account")
 		collect(pool, 1)
 	assert seen == [(threading.current_thread(), None)]
+
+
+def test_controller_does_not_climb_on_completions_alone(monkeypatch) -> None:
+	logs: list[str] = []
+	pool = _adaptive_pool(monkeypatch, logs)
+	with pool:
+		for batch in range(10):
+			for i in range(6):
+				pool.submit(batch * 10 + i, i, key=batch * 10 + i)
+			collect(pool, 6)
+		assert pool.limit == 3 and not logs

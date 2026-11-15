@@ -6,7 +6,7 @@ import pytest
 from csvmusic.core import downloader
 from csvmusic.core.downloader import (
 	CancelToken, DownloadCancelled, YouTubeMitigationProfile, YtdlpPacer, pacer_gap_for_profile,
-	pacer_scope, scale_profile_for_concurrency, detect_concurrency_risk,
+	pacer_scope, scale_profile_for_concurrency, detect_youtube_risk,
 )
 
 
@@ -124,13 +124,13 @@ def test_pacer_gap_for_profile():
 	"Sign in to confirm you're not a bot", "Sign in to confirm you’re not a bot", "Bot verification required",
 	"HTTP Error 429: Too Many Requests",
 ])
-def test_detect_concurrency_risk_positive(text):
-	assert detect_concurrency_risk(text)
+def test_detect_youtube_risk_positive(text):
+	assert detect_youtube_risk(text)
 
 
 @pytest.mark.parametrize("text", ["", "private video", "network unreachable"])
-def test_detect_concurrency_risk_negative(text):
-	assert detect_concurrency_risk(text) is None
+def test_detect_youtube_risk_negative(text):
+	assert detect_youtube_risk(text) is None
 
 
 def test_pacer_scope_tuple_acquires_in_order_and_lane_gap():
