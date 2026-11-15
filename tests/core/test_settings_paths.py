@@ -32,16 +32,14 @@ def test_macos_migrates_previous_cross_platform_location(monkeypatch, tmp_path: 
 	assert (target / "library.json").exists()
 
 
-def test_download_workers_clamps_and_defaults() -> None:
-	assert settings.download_workers({}) == 3
+def test_download_workers_clamps_and_defaults_to_automatic() -> None:
+	for value in (None, True, "abc", "", "auto"):
+		assert settings.download_workers({"download_workers": value}) is None
+	assert settings.download_workers({}) is None
+	assert settings.download_workers({"download_workers": "3"}) == 3
 	assert settings.download_workers({"download_workers": 0}) == 1
 	assert settings.download_workers({"download_workers": -1}) == 1
-	assert settings.download_workers({"download_workers": 7}) == 4
-	assert settings.download_workers({"download_workers": 2}) == 2
-	assert settings.download_workers({"download_workers": "2"}) == 2
-	assert settings.download_workers({"download_workers": "abc"}) == 3
-	assert settings.download_workers({"download_workers": None}) == 3
-	assert settings.download_workers({"download_workers": True}) == 3
+	assert settings.download_workers({"download_workers": 99}) == 8
 
 
 def test_pipeline_worker_stores_max_workers() -> None:

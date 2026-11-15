@@ -58,15 +58,16 @@ def load_settings() -> dict:
 		pass
 	return {}
 
-def download_workers(settings: dict) -> int:
+def download_workers(settings: dict) -> int | None:
+	"""User-chosen maximum of parallel downloads, clamped to 1..8; None means automatic."""
 	value = settings.get("download_workers")
 	if isinstance(value, bool):
-		return 3
+		return None
 	try:
 		number = int(value)
 	except (TypeError, ValueError):
-		return 3
-	return max(1, min(4, number))
+		return None
+	return max(1, min(8, number))
 
 def _should_clear(value: object) -> bool:
 	if value is None:

@@ -1,5 +1,6 @@
 # tabs only
 from PySide6.QtCore import QObject, Signal, QThread
+import os
 import pathlib, traceback, time
 from contextlib import nullcontext
 from contextvars import ContextVar
@@ -257,7 +258,7 @@ class PipelineWorker(QThread):
 	             m3u_tracks_override: List[Dict] | None = None,
 	             m3u_output_dir: str | None = None,
 	             row_indices: List[int] | None = None,
-	             max_workers: int = 1,
+	             max_workers: int | None = 1,
 	             parent: QObject | None = None):
 		super().__init__(parent)
 		self.max_workers = max_workers
@@ -633,12 +634,12 @@ class PipelineWorker(QThread):
 
 	def _pool_policy(self) -> PoolPolicy:
 		in_process = False
-		if self.max_workers > 1:
+		if self.max_workers != 1:
 			try:
 				in_process = (self.yt_dlp_path or _resolve_ytdlp()) == INTERNAL_YTDLP
 			except RuntimeError:
 				pass  # no yt-dlp at all: downloads fail with their own error, it is not the in-process case
-		return PoolPolicy(self.max_workers, bool(self.cookies_file or self.cookies_browser), in_process)
+		return PoolPolicy(self.max_workers, bool(self.cookies_file or self.cookies_browser), in_process, os.cpu_count())
 
 	def _wait_for_slot(self, pool: DownloadPool, state: "_BatchState") -> None:
 		"""Serve the pool until a slot is free and the pacing deadline has passed (stop ends the wait at once)."""

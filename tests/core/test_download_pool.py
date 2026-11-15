@@ -24,14 +24,22 @@ def collect(pool: DownloadPool, count: int) -> list[Completion]:
 	return done
 
 
+def _limit(requested, profile=N, *, cookies=False, in_process=False, cpus=4) -> int:
+	return concurrency_limit(requested, profile, account_cookies=cookies, in_process_ytdlp=in_process, cpu_count=cpus)
+
+
 def test_limit_table() -> None:
-	for requested in range(1, 5):
-		assert concurrency_limit(requested, N, account_cookies=False, in_process_ytdlp=False) == min(requested, 3)
-		assert concurrency_limit(requested, L, account_cookies=False, in_process_ytdlp=False) == min(requested, 2)
-		assert concurrency_limit(requested, A, account_cookies=False, in_process_ytdlp=False) == 1
-		assert concurrency_limit(requested, N, account_cookies=True, in_process_ytdlp=False) == min(requested, 2)
-		assert concurrency_limit(requested, N, account_cookies=False, in_process_ytdlp=True) == 1
-	assert concurrency_limit(0, N, account_cookies=False, in_process_ytdlp=False) == 1
+	for cpus, expected in [(1, 2), (2, 3), (4, 6), (8, 8), (12, 8), (None, 2)]:
+		assert _limit(None, N, cpus=cpus) == expected
+		assert _limit(None, L, cpus=cpus) == expected
+	for requested, expected in [(0, 1), (1, 1), (3, 3), (8, 8), (99, 8)]:
+		assert _limit(requested, N) == expected
+		assert _limit(requested, L) == expected
+	for requested in (None, 1, 5):
+		assert _limit(requested, A) == 1
+		assert _limit(requested, N, in_process=True) == 1
+		assert _limit(requested, N, cookies=True) == min(2, _limit(requested, N))
+	assert _limit(None, N, cookies=True, cpus=12) == 2
 
 
 @pytest.mark.parametrize("profile", [N, L, A])

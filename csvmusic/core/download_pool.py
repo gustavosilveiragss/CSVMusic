@@ -10,9 +10,9 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Callable, Hashable
 
-from .concurrency import AdaptiveLimit
+from .concurrency import AdaptiveLimit, hard_cap
 from .downloader import (
-	YOUTUBE_MITIGATION_AGGRESSIVE, YOUTUBE_MITIGATION_LARGE_BATCH, YOUTUBE_MITIGATION_NONE,
+	YOUTUBE_MITIGATION_AGGRESSIVE,
 	CancelToken, DownloadCancelled, YouTubeMitigationProfile, YtdlpPacer, pacer_gap_for_profile,
 	pacer_scope, process_scope, scale_profile_for_concurrency,
 )
@@ -21,21 +21,21 @@ from .ytmusic_match import RATE_LIMIT_S
 
 MATCH_GAP_S = RATE_LIMIT_S  # floor between two searches; read as download_pool.MATCH_GAP_S so tests can zero it
 
-_PROFILE_CAPS = {
-	YOUTUBE_MITIGATION_NONE.label: 3,
-	YOUTUBE_MITIGATION_LARGE_BATCH.label: 2,
-	YOUTUBE_MITIGATION_AGGRESSIVE.label: 1,
-}
 _ACCOUNT_COOKIES_CAP = 2
+_MAX_REQUESTED = 8
 
 
-def concurrency_limit(requested: int, profile: YouTubeMitigationProfile, *, account_cookies: bool, in_process_ytdlp: bool) -> int:
-	if in_process_ytdlp:
+def concurrency_limit(
+	requested: int | None, profile: YouTubeMitigationProfile, *, account_cookies: bool, in_process_ytdlp: bool,
+	cpu_count: int | None,
+) -> int:
+	"""Hard ceiling for the adaptive controller; the pacer, not this cap, rate-limits requests."""
+	if in_process_ytdlp or profile.label == YOUTUBE_MITIGATION_AGGRESSIVE.label:
 		return 1
-	cap = _PROFILE_CAPS.get(profile.label, _PROFILE_CAPS[YOUTUBE_MITIGATION_NONE.label])
+	cap = hard_cap(cpu_count) if requested is None else max(1, min(requested, _MAX_REQUESTED))
 	if account_cookies:
 		cap = min(cap, _ACCOUNT_COOKIES_CAP)
-	return max(1, min(requested, cap))
+	return cap
 
 
 def track_pause_s(profile: YouTubeMitigationProfile, *, uniform: Callable[[float, float], float] = random.uniform) -> float:
@@ -47,12 +47,13 @@ def track_pause_s(profile: YouTubeMitigationProfile, *, uniform: Callable[[float
 
 @dataclass(frozen=True)
 class PoolPolicy:
-	requested: int
+	requested: int | None
 	account_cookies: bool = False
 	in_process_ytdlp: bool = False
+	cpu_count: int | None = None
 
 	def max_limit(self, profile: YouTubeMitigationProfile) -> int:
-		return concurrency_limit(self.requested, profile, account_cookies=self.account_cookies, in_process_ytdlp=self.in_process_ytdlp)
+		return concurrency_limit(self.requested, profile, account_cookies=self.account_cookies, in_process_ytdlp=self.in_process_ytdlp, cpu_count=self.cpu_count)
 
 
 @dataclass(frozen=True)
