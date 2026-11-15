@@ -260,3 +260,106 @@ def test_inline_uses_caller_thread_without_pacer_and_threaded_has_pacer() -> Non
 		pool.submit(0, 0, key=0)
 		collect(pool, 1)
 	assert seen[0][0] is not threading.current_thread() and seen[0][1] is pool._pacer and seen[0][2]
+
+
+def _adaptive_pool(monkeypatch, logs: list[str], run=lambda item, ctx: item) -> DownloadPool:
+	from csvmusic.core import download_pool
+
+	monkeypatch.setattr(download_pool, "concurrency_limit", lambda *a, **k: 6)
+	monkeypatch.setattr(download_pool, "log", logs.append)
+	now = [0.0]
+	holder: list[DownloadPool] = []
+
+	def clock() -> float:
+		# Called under the pool lock, so read the controller directly; throughput grows with the level.
+		now[0] += 18.0 / (holder[0]._adaptive.level if holder else 3)
+		return now[0]
+
+	pool = DownloadPool(run, PoolPolicy(6), N, clock=clock)
+	holder.append(pool)
+	return pool
+
+
+def test_adaptive_limit_climbs_and_gates_in_flight(monkeypatch) -> None:
+	logs: list[str] = []
+	lock = threading.Lock()
+	state = {"cur": 0, "max": 0}
+	release = threading.Event()
+
+	def run(item, ctx):
+		with lock:
+			state["cur"] += 1
+			state["max"] = max(state["max"], state["cur"])
+		if item[1] < item[0]:
+			assert release.wait(5)
+		with lock:
+			state["cur"] -= 1
+		return item
+
+	pool = _adaptive_pool(monkeypatch, logs, run)
+	with pool:
+		assert pool.limit == 3
+		seen = {pool.limit}
+		for phase in range(40):
+			lim = pool.limit
+			if lim == 6:
+				break
+			release.clear()
+			state["max"] = 0
+			for i in range(lim + 2):
+				pool.submit(phase * 100 + i, (lim, i), key=phase * 100 + i)
+			done: list[Completion] = []
+			while True:
+				done += [m for m in pool.pump(0.05) if isinstance(m, Completion)]
+				with lock:
+					if state["cur"] == lim:
+						release.set()
+				if len(done) == lim + 2:
+					break
+			assert state["max"] == lim
+			assert lim <= pool.limit <= 6
+			seen.add(pool.limit)
+		assert pool.limit == 6
+	assert {3, 4, 5, 6} <= seen
+	assert any(m.startswith("concurrency: ") and "action=climb" in m for m in logs)
+
+
+def test_apply_profile_ceiling_one_drops_limit_now(monkeypatch) -> None:
+	from csvmusic.core import download_pool
+
+	logs: list[str] = []
+	pool = _adaptive_pool(monkeypatch, logs)
+	monkeypatch.setattr(download_pool, "concurrency_limit", lambda requested, profile, **k: 1 if profile is A else 6)
+	with pool:
+		assert pool.limit == 3 and pool.has_capacity()
+		for i in range(3):
+			pool.submit(i, i, key=i)
+		assert not pool.has_capacity()
+		pool.apply_profile(A)
+		assert pool.limit == 1
+		assert not pool.has_capacity()
+		collect(pool, 3)
+		assert pool.has_capacity()
+
+
+def test_cancelled_completions_do_not_feed_controller(monkeypatch) -> None:
+	logs: list[str] = []
+	pool = _adaptive_pool(monkeypatch, logs)
+	calls: list[int] = []
+	real = pool._adaptive.on_completion
+	pool._adaptive.on_completion = lambda: calls.append(1) or real()  # type: ignore[method-assign]
+	with pool:
+		for i in range(5):
+			pool.submit(i, i, key=i)
+		pool.cancel()
+		got = [m for m in pool.pump(0.2) if isinstance(m, Completion)]
+		assert len(got) == 5 and all(c.cancelled for c in got)
+		assert pool.limit == 3 and not calls and not logs
+
+
+def test_inline_has_no_active_controller() -> None:
+	with DownloadPool(lambda item, ctx: item, PoolPolicy(1), N) as pool:
+		for i in range(10):
+			pool.submit(i, i, key=i)
+			collect(pool, 1)
+		assert pool.limit == 1

@@ -4,16 +4,19 @@ from __future__ import annotations
 import queue
 import random
 import threading
+import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Callable, Hashable
 
+from .concurrency import AdaptiveLimit
 from .downloader import (
 	YOUTUBE_MITIGATION_AGGRESSIVE, YOUTUBE_MITIGATION_LARGE_BATCH, YOUTUBE_MITIGATION_NONE,
 	CancelToken, DownloadCancelled, YouTubeMitigationProfile, YtdlpPacer, pacer_gap_for_profile,
 	pacer_scope, process_scope, scale_profile_for_concurrency,
 )
+from .log import log
 from .ytmusic_match import RATE_LIMIT_S
 
 MATCH_GAP_S = RATE_LIMIT_S  # floor between two searches; read as download_pool.MATCH_GAP_S so tests can zero it
@@ -94,7 +97,10 @@ class _InlineExecutor:
 class DownloadPool:
 	"""The pool owns the mitigation profile, the cancel state and every wait of its coordinator."""
 
-	def __init__(self, run: Callable[[Any, JobContext], Any], policy: PoolPolicy, profile: YouTubeMitigationProfile) -> None:
+	def __init__(
+		self, run: Callable[[Any, JobContext], Any], policy: PoolPolicy, profile: YouTubeMitigationProfile,
+		*, clock: Callable[[], float] = time.monotonic,
+	) -> None:
 		self._run = run
 		self._policy = policy
 		self._profile = profile
@@ -105,11 +111,12 @@ class DownloadPool:
 		self._in_flight: dict[int, Hashable] = {}
 		self._closed = False
 		self._cancelled = False
-		max_limit = policy.max_limit(profile)
-		self._limit = max_limit
-		self._parallel = max_limit > 1
+		ceiling = policy.max_limit(profile)
+		# The adaptive controller owns the limit and is only touched under self._lock (it has no lock of its own).
+		self._adaptive = AdaptiveLimit(start=min(3, ceiling), ceiling=ceiling, clock=clock)
+		self._parallel = ceiling > 1
 		self._pacer = YtdlpPacer(*pacer_gap_for_profile(profile), cancel=self._token) if self._parallel else None
-		self._executor: Any = ThreadPoolExecutor(max_workers=max_limit) if self._parallel else _InlineExecutor()
+		self._executor: Any = ThreadPoolExecutor(max_workers=ceiling) if self._parallel else _InlineExecutor()
 
 	def __enter__(self) -> "DownloadPool":
 		return self
@@ -125,7 +132,8 @@ class DownloadPool:
 
 	@property
 	def limit(self) -> int:
-		return self._limit
+		with self._lock:
+			return self._adaptive.level
 
 	@property
 	def parallel(self) -> bool:
@@ -150,7 +158,7 @@ class DownloadPool:
 
 	def has_capacity(self) -> bool:
 		with self._lock:
-			return not self._closed and len(self._in_flight) + len(self._ready) < self._limit
+			return not self._closed and len(self._in_flight) + len(self._ready) < self._adaptive.level
 
 	def idle(self) -> bool:
 		with self._lock:
@@ -159,13 +167,13 @@ class DownloadPool:
 	def apply_profile(self, profile: YouTubeMitigationProfile) -> None:
 		with self._lock:
 			self._profile = profile
-			self._limit = min(self._limit, self._policy.max_limit(profile))
+			self._adaptive.lower_ceiling(self._policy.max_limit(profile))
 		if self._pacer is not None:
 			self._pacer.set_gap(*pacer_gap_for_profile(profile))
 
 	def job_profile(self) -> YouTubeMitigationProfile:
 		with self._lock:
-			return scale_profile_for_concurrency(self._profile, self._limit)
+			return scale_profile_for_concurrency(self._profile, self._adaptive.level)
 
 	def close(self) -> None:
 		with self._lock:
@@ -213,12 +221,16 @@ class DownloadPool:
 		if isinstance(msg, Completion):
 			with self._lock:
 				self._in_flight.pop(msg.index, None)
+				# Jobs that failed fast still count, which inflates throughput; accepted bias.
+				action = None if msg.cancelled else self._adaptive.on_completion()
+				if action:
+					log(f"concurrency: {self._adaptive.describe()} action={action}")
 		return msg
 
 	def _dispatch(self) -> None:
 		while True:
 			with self._lock:
-				if self._cancelled or len(self._in_flight) >= self._limit:
+				if self._cancelled or len(self._in_flight) >= self._adaptive.level:
 					return
 				busy = set(self._in_flight.values())
 				pick = next((e for e in self._ready if e[2] not in busy), None)
