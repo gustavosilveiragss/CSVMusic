@@ -1,5 +1,5 @@
 # tabs only
-import os, pathlib, subprocess, requests, io, contextlib, json, base64, hashlib
+import os, pathlib, signal, subprocess, sys, requests, io, contextlib, json, base64, hashlib
 from dataclasses import dataclass, replace
 from collections.abc import Callable
 from typing import Dict, Optional, List
@@ -14,7 +14,7 @@ from csvmusic.core.paths import ffmpeg_path, ytdlp_path, INTERNAL_YTDLP
 from csvmusic.core.log import log
 from csvmusic.core.timing import timed
 from csvmusic.core.js_runtime import ytdlp_js_runtime_args
-from csvmusic.core.subprocess_env import subprocess_kwargs
+from csvmusic.core.subprocess_env import hidden_subprocess_kwargs, subprocess_kwargs
 from csvmusic.core.source_quality import capture_source, store_source
 
 YTM_URL = "https://music.youtube.com/watch?v={vid}"
@@ -94,6 +94,18 @@ class CancelToken:
 
 
 def _kill(proc: subprocess.Popen) -> None:
+	# Kill the whole tree: a surviving grandchild keeps the pipe open and would block communicate().
+	try:
+		if sys.platform == "win32":
+			subprocess.run(
+				["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+				capture_output=True, timeout=10, **hidden_subprocess_kwargs(),
+			)
+		else:
+			os.killpg(proc.pid, signal.SIGKILL)
+		return
+	except (OSError, subprocess.SubprocessError):
+		pass
 	try:
 		proc.kill()
 	except OSError:
@@ -295,6 +307,7 @@ def _run_capture(cmd: list[str], *, timeout: float | None = None) -> subprocess.
 			text=True,
 			encoding="utf-8",
 			errors="replace",
+			**({"start_new_session": True} if sys.platform != "win32" else {}),
 			**subprocess_kwargs()
 		)
 		if token is not None:
@@ -303,7 +316,7 @@ def _run_capture(cmd: list[str], *, timeout: float | None = None) -> subprocess.
 			try:
 				stdout, stderr = proc.communicate(timeout=timeout)
 			except subprocess.TimeoutExpired:
-				proc.kill()
+				_kill(proc)
 				proc.communicate()
 				info["rc"] = proc.returncode
 				if token is not None and token.cancelled:
