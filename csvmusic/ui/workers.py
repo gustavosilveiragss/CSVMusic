@@ -12,6 +12,7 @@ from ytmusicapi import YTMusic
 from csvmusic.core.csv_import import load_csv, tracks_from_csv
 from csvmusic.core.url_import import fetch_music_url
 from csvmusic.core.log import log
+from csvmusic.core.timing import timed
 from csvmusic.core.ytmusic_match import find_best, more_candidates, RATE_LIMIT_S, CONFIDENCE_MIN
 from csvmusic.core.downloader import (
 	download_m4a, download_mp3, download_opus, tag_file, yt_thumbnail_bytes, cover_art_url_bytes, write_m3u, sanitize_name,
@@ -354,6 +355,7 @@ class PipelineWorker(QThread):
 				if self._stop:
 					break
 				t = track
+				track_started = time.monotonic()
 				track_playlist_name = self.playlist or t.get("playlist") or playlist_name
 				dest_dir = self.out_dir / (sanitize_name(track_playlist_name) or "Playlist")
 				dest_dir.mkdir(parents=True, exist_ok=True)
@@ -379,7 +381,8 @@ class PipelineWorker(QThread):
 						options = [match]
 						confidence = 1.0
 					else:
-						match, confidence, options = find_best(yt, t)
+						with timed("match"):
+							match, confidence, options = find_best(yt, t)
 				except Exception as exc:
 					search_error = str(exc)
 				if search_error:
@@ -475,9 +478,11 @@ class PipelineWorker(QThread):
 								self._attempt_status_text(candidate, attempt_idx, len(candidate_sequence))
 							)
 						try:
-							fp = self._download_with_profile(vid, dest_dir, base, self._mitigation)
+							with timed("download"):
+								fp = self._download_with_profile(vid, dest_dir, base, self._mitigation)
 							self.sig_row_status.emit(row_idx, "Tagging…")
-							cover = _track_cover_bytes(t, vid)
+							with timed("cover"):
+								cover = _track_cover_bytes(t, vid)
 							tag_file(fp, t, cover if self.embed_art else None, cover_size=_legacy_cover_size(self.legacy_options, embed_art=self.embed_art))
 							payload["match"] = candidate
 							break
@@ -551,9 +556,11 @@ class PipelineWorker(QThread):
 					if quality["low"]:
 						self.sig_log.emit(f"[warn] Low YouTube source bitrate: {title} — {quality['codec']} ~{quality['kbps']} kbps")
 						self.sig_row_status.emit(row_idx, "Downloaded — low quality")
+				log(f"timing: stage=track seconds={time.monotonic() - track_started:.1f} ok={error_msg is None}")
 				self.sig_track_result.emit(row_idx, payload)
 				if not self._stop and idx < total - 1:
-					time.sleep(self._track_pause_s())
+					with timed("pause"):
+						time.sleep(self._track_pause_s())
 				time.sleep(0.02)
 			if done_tracks:
 				ext = self.fmt if self.fmt in ("m4a", "mp3", "opus") else "mp3"

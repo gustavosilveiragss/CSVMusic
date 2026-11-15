@@ -12,6 +12,7 @@ from mutagen.oggopus import OggOpus
 from mutagen.flac import Picture
 from csvmusic.core.paths import ffmpeg_path, ytdlp_path, INTERNAL_YTDLP
 from csvmusic.core.log import log
+from csvmusic.core.timing import timed
 from csvmusic.core.js_runtime import ytdlp_js_runtime_args
 from csvmusic.core.subprocess_env import subprocess_kwargs
 from csvmusic.core.source_quality import capture_source, store_source
@@ -142,18 +143,34 @@ def _run(cmd: list[str]) -> int:
 		log(f"yt-dlp command failed rc={proc.returncode} cmd={' '.join(cmd)} stderr={err[:500]} stdout={out[:200]}")
 	return proc.returncode
 
+def _timing_fields(cmd: list[str]) -> dict[str, str]:
+	tool = "yt-dlp" if cmd[0] == INTERNAL_YTDLP else os.path.basename(cmd[0])
+	if not tool.startswith("yt-dlp"):
+		return {"tool": tool}
+	client = next((arg.split("=", 1)[1] for arg in cmd if arg.startswith("youtube:player_client=")), "default")
+	return {"tool": tool, "client": client, "url": cmd[-1]}
+
 def _run_capture(cmd: list[str]) -> subprocess.CompletedProcess[str]:
-	return subprocess.run(
-		cmd,
-		stdout=subprocess.PIPE,
-		stderr=subprocess.PIPE,
-		text=True,
-		encoding="utf-8",
-		errors="replace",
-		**subprocess_kwargs()
-	)
+	with timed("process", **_timing_fields(cmd)) as info:
+		proc = subprocess.run(
+			cmd,
+			stdout=subprocess.PIPE,
+			stderr=subprocess.PIPE,
+			text=True,
+			encoding="utf-8",
+			errors="replace",
+			**subprocess_kwargs()
+		)
+		info["rc"] = proc.returncode
+	return proc
 
 def _run_ytdlp_module(args: list[str]) -> tuple[int, str, str]:
+	with timed("process", **_timing_fields([INTERNAL_YTDLP, *args])) as info:
+		result = _call_ytdlp_module(args)
+		info["rc"] = result[0]
+	return result
+
+def _call_ytdlp_module(args: list[str]) -> tuple[int, str, str]:
 	stdout_buf = io.StringIO()
 	stderr_buf = io.StringIO()
 	try:
