@@ -371,3 +371,130 @@ def test_inline_has_no_active_controller() -> None:
 			pool.submit(i, i, key=i)
 			collect(pool, 1)
 		assert pool.limit == 1
+
+
+def _lane_pool(run, limit=2, requested=6, monkeypatch=None) -> DownloadPool:
+	from csvmusic.core import download_pool
+
+	if monkeypatch is not None:
+		monkeypatch.setattr(download_pool, "concurrency_limit", lambda *a, **k: requested)
+	return DownloadPool(run, PoolPolicy(requested, lane_limits={"account": limit}), N)
+
+
+def test_lane_limit_never_exceeded_and_anonymous_keep_going(monkeypatch) -> None:
+	lock = threading.Lock()
+	state = {"cur": 0, "max": 0}
+	anon_started = threading.Event()
+	release = threading.Event()
+
+	def run(item, ctx):
+		if item == "anon":
+			anon_started.set()
+			release.wait(5)
+			return item
+		with lock:
+			state["cur"] += 1
+			state["max"] = max(state["max"], state["cur"])
+		release.wait(5)
+		with lock:
+			state["cur"] -= 1
+		return item
+
+	with _lane_pool(run, monkeypatch=monkeypatch) as pool:
+		for i in range(6):
+			pool.submit(i, "acc", key=i, lane="account")
+		pool.submit(10, "anon", key=10)
+		pool.pump(0)
+		assert anon_started.wait(5)  # started while the lane is full
+		assert state["cur"] <= 2 and len(pool._in_flight) == 3
+		release.set()
+		done = collect(pool, 7)
+	assert len(done) == 7 and state["max"] == 2
+
+
+def test_full_lane_does_not_block_following_entries(monkeypatch) -> None:
+	release = threading.Event()
+	ran: list[int] = []
+
+	def run(item, ctx):
+		ran.append(item)
+		if item < 2:
+			release.wait(5)
+		return item
+
+	with _lane_pool(run, monkeypatch=monkeypatch) as pool:
+		for i in range(3):
+			pool.submit(i, i, key=i, lane="account")
+		pool.submit(3, 3, key=3, lane="other")
+		pool.submit(4, 4, key=4)
+		pool._dispatch()
+		assert [e[0] for e in pool._ready] == [2, 4]  # global level is 3; entry 2 is parked, 3 passed it
+		assert sorted(pool._in_flight) == [0, 1, 3]
+		release.set()
+		collect(pool, 5)
+	assert sorted(ran) == [0, 1, 2, 3, 4]
+
+
+def test_priority_respects_lane_limit(monkeypatch) -> None:
+	release = threading.Event()
+	ran: list[int] = []
+
+	def run(item, ctx):
+		ran.append(item)
+		release.wait(5)
+
+	with _lane_pool(run, monkeypatch=monkeypatch) as pool:
+		pool.submit(0, 0, key=0, lane="account")
+		pool.submit(1, 1, key=1, lane="account")
+		pool.pump(0)
+		pool.submit(2, 2, key=2, lane="account", priority=True)
+		pool.submit(3, 3, key=3)
+		pool._dispatch()
+		assert [e[0] for e in pool._ready] == [2]
+		assert 3 in pool._in_flight and 2 not in pool._in_flight
+		release.set()
+		collect(pool, 4)
+
+
+def test_cancel_drops_ready_lane_entries(monkeypatch) -> None:
+	release = threading.Event()
+
+	def run(item, ctx):
+		release.wait(5)
+
+	with _lane_pool(run, monkeypatch=monkeypatch) as pool:
+		for i in range(4):
+			pool.submit(i, i, key=i, lane="account")
+		pool.pump(0)
+		assert not pool.idle() and not pool.has_capacity()
+		pool.cancel()
+		release.set()
+		done = collect(pool, 4)
+	assert sorted(c.index for c in done if c.cancelled) == [2, 3]
+
+
+def test_lane_pacer_order_and_no_lane_uses_global_only(monkeypatch) -> None:
+	seen = {}
+
+	def run(item, ctx):
+		seen[item] = downloader._active_pacer.__dict__.get("pacer")
+
+	with _lane_pool(run, monkeypatch=monkeypatch) as pool:
+		pool.submit(0, "lane", key=0, lane="account")
+		pool.submit(1, "free", key=1)
+		collect(pool, 2)
+		assert seen["lane"] == (pool._lane_pacers["account"], pool._pacer)
+		assert seen["free"] is pool._pacer
+
+
+def test_inline_ignores_lane_pacers_and_limits() -> None:
+	seen = []
+
+	def run(item, ctx):
+		seen.append((threading.current_thread(), downloader._active_pacer.__dict__.get("pacer")))
+
+	with DownloadPool(run, PoolPolicy(1, lane_limits={"account": 2}), N) as pool:
+		assert not pool._lane_pacers
+		pool.submit(0, 0, key=0, lane="account")
+		collect(pool, 1)
+	assert seen == [(threading.current_thread(), None)]

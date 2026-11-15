@@ -131,3 +131,20 @@ def test_detect_concurrency_risk_positive(text):
 @pytest.mark.parametrize("text", ["", "private video", "network unreachable"])
 def test_detect_concurrency_risk_negative(text):
 	assert detect_concurrency_risk(text) is None
+
+
+def test_pacer_scope_tuple_acquires_in_order_and_lane_gap():
+	order: list[str] = []
+
+	class Named:
+		def __init__(self, name: str) -> None:
+			self.name = name
+
+		def acquire(self) -> None:
+			order.append(self.name)
+
+	with pacer_scope((Named("lane"), Named("global"))):
+		downloader._pace_ytdlp()
+	assert order == ["lane", "global"]
+	assert downloader.lane_pacer_gap("account") == downloader.ACCOUNT_LANE_GAP
+	assert downloader.lane_pacer_gap("other") is None

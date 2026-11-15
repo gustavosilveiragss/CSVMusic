@@ -7,13 +7,13 @@ import threading
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
-from typing import Any, Callable, Hashable
+from dataclasses import dataclass, field
+from typing import Any, Callable, Hashable, Mapping
 
 from .concurrency import AdaptiveLimit, hard_cap
 from .downloader import (
 	YOUTUBE_MITIGATION_AGGRESSIVE,
-	CancelToken, DownloadCancelled, YouTubeMitigationProfile, YtdlpPacer, pacer_gap_for_profile,
+	CancelToken, DownloadCancelled, YouTubeMitigationProfile, YtdlpPacer, lane_pacer_gap, pacer_gap_for_profile,
 	pacer_scope, process_scope, scale_profile_for_concurrency,
 )
 from .log import log
@@ -51,6 +51,7 @@ class PoolPolicy:
 	account_cookies: bool = False
 	in_process_ytdlp: bool = False
 	cpu_count: int | None = None
+	lane_limits: Mapping[str, int] = field(default_factory=dict)  # per-lane ceiling; a lane absent here is uncapped
 
 	def max_limit(self, profile: YouTubeMitigationProfile) -> int:
 		return concurrency_limit(self.requested, profile, account_cookies=self.account_cookies, in_process_ytdlp=self.in_process_ytdlp, cpu_count=self.cpu_count)
@@ -108,8 +109,8 @@ class DownloadPool:
 		self._lock = threading.Lock()
 		self._token = CancelToken()
 		self._out: "queue.Queue[JobEvent | Completion]" = queue.Queue()
-		self._ready: deque[tuple[int, Any, Hashable]] = deque()
-		self._in_flight: dict[int, Hashable] = {}
+		self._ready: deque[tuple[int, Any, Hashable, str | None]] = deque()
+		self._in_flight: dict[int, tuple[Hashable, str | None]] = {}
 		self._closed = False
 		self._cancelled = False
 		ceiling = policy.max_limit(profile)
@@ -117,6 +118,10 @@ class DownloadPool:
 		self._adaptive = AdaptiveLimit(start=min(3, ceiling), ceiling=ceiling, clock=clock)
 		self._parallel = ceiling > 1
 		self._pacer = YtdlpPacer(*pacer_gap_for_profile(profile), cancel=self._token) if self._parallel else None
+		self._lane_pacers = {
+			lane: YtdlpPacer(*gap, cancel=self._token) for lane in policy.lane_limits
+			if self._parallel and (gap := lane_pacer_gap(lane)) is not None
+		}
 		self._executor: Any = ThreadPoolExecutor(max_workers=ceiling) if self._parallel else _InlineExecutor()
 
 	def __enter__(self) -> "DownloadPool":
@@ -144,13 +149,13 @@ class DownloadPool:
 	def cancelled(self) -> bool:
 		return self._cancelled
 
-	def submit(self, index: int, item: Any, *, key: Hashable, priority: bool = False) -> bool:
+	def submit(self, index: int, item: Any, *, key: Hashable, priority: bool = False, lane: str | None = None) -> bool:
 		# close() stops new tracks but still takes a priority retry of an accepted one (a 429 in flight
 		# when the search aborted must not lose its safe-mode retry); cancel() rejects everything.
 		with self._lock:
 			if self._cancelled or (self._closed and not priority):
 				return False
-			entry = (index, item, key)
+			entry = (index, item, key, lane)
 			if priority:
 				self._ready.appendleft(entry)
 			else:
@@ -188,7 +193,7 @@ class DownloadPool:
 			self._cancelled = True
 			dropped = list(self._ready)
 			self._ready.clear()
-			for index, item, _key in dropped:
+			for index, item, _key, _lane in dropped:
 				self._out.put(Completion(index, item, None, None, True))
 			self._out.put(_WAKE)
 		if first:
@@ -233,18 +238,24 @@ class DownloadPool:
 			with self._lock:
 				if self._cancelled or len(self._in_flight) >= self._adaptive.level:
 					return
-				busy = set(self._in_flight.values())
-				pick = next((e for e in self._ready if e[2] not in busy), None)
+				busy = {key for key, _lane in self._in_flight.values()}
+				lanes = [lane for _key, lane in self._in_flight.values() if lane is not None]
+				limits = self._policy.lane_limits
+				# A ready entry parked because its lane is full must not block the ones behind it.
+				pick = next((e for e in self._ready if e[2] not in busy and (e[3] not in limits or lanes.count(e[3]) < limits[e[3]])), None)
 				if pick is None:
 					return
 				self._ready.remove(pick)
-				self._in_flight[pick[0]] = pick[2]
-			self._executor.submit(self._job, pick[0], pick[1])
+				self._in_flight[pick[0]] = (pick[2], pick[3])
+			self._executor.submit(self._job, pick[0], pick[1], pick[3])
 
-	def _job(self, index: int, item: Any) -> None:
+	def _job(self, index: int, item: Any, lane: str | None) -> None:
 		ctx = JobContext(index, self._out, self._parallel)
+		# Lane pacer first so a job waiting on its lane gap holds no global slot.
+		lane_pacer = self._lane_pacers.get(lane) if lane is not None else None
+		pacer = (lane_pacer, self._pacer) if lane_pacer is not None and self._pacer is not None else self._pacer
 		try:
-			with process_scope(self._token), pacer_scope(self._pacer):
+			with process_scope(self._token), pacer_scope(pacer):
 				result = self._run(item, ctx)
 			done = Completion(index, item, result, None, False)
 		except DownloadCancelled:

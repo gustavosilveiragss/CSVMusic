@@ -164,8 +164,8 @@ _active_pacer = threading.local()
 
 
 @contextlib.contextmanager
-def pacer_scope(pacer: YtdlpPacer | None):
-	"""Make pacer the active one for yt-dlp launches on this thread."""
+def pacer_scope(pacer: YtdlpPacer | tuple[YtdlpPacer, ...] | None):
+	"""Make pacer (or a tuple acquired in order) the active one for yt-dlp launches on this thread."""
 	previous = getattr(_active_pacer, "pacer", None)
 	_active_pacer.pacer = pacer
 	try:
@@ -176,8 +176,10 @@ def pacer_scope(pacer: YtdlpPacer | None):
 
 def _pace_ytdlp() -> None:
 	pacer = getattr(_active_pacer, "pacer", None)
-	if pacer is not None:
-		pacer.acquire()
+	if pacer is None:
+		return
+	for each in pacer if isinstance(pacer, tuple) else (pacer,):
+		each.acquire()
 
 
 class AgeRestrictedError(DownloadError):
@@ -256,6 +258,14 @@ _PACER_GAPS = {
 	YOUTUBE_MITIGATION_LARGE_BATCH.label: (8.0, 2.0),
 	YOUTUBE_MITIGATION_AGGRESSIVE.label: (12.0, 2.0),
 }
+
+
+ACCOUNT_LANE_GAP = (8.0, 2.0)  # hypothesis, to be calibrated
+
+
+def lane_pacer_gap(lane: str) -> tuple[float, float] | None:
+	"""(min_gap_s, jitter_s) of a lane's own pacer; None when the lane has no pacer."""
+	return ACCOUNT_LANE_GAP if lane == "account" else None
 
 
 def pacer_gap_for_profile(profile: YouTubeMitigationProfile) -> tuple[float, float]:
