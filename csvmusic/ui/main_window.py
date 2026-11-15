@@ -16,7 +16,7 @@ from PySide6.QtCore import Qt, QSignalBlocker, QUrl, Signal, QRect, QSize, QTime
 from PySide6.QtGui import QColor, QFont, QIcon, QPixmap, QFontDatabase, QGuiApplication, QDesktopServices, QPainter, QPen
 
 from csvmusic.core.csv_import import load_csv, tracks_from_csv
-from csvmusic.core.settings import load_settings, save_settings
+from csvmusic.core.settings import download_workers, load_settings, save_settings
 from csvmusic.core.update_check import UpdateInfo, should_check_for_updates, update_check_timestamp
 from csvmusic.core.downloader import sanitize_name, youtube_batch_mitigation, youtube_risk_acknowledgement
 from csvmusic.core.preflight import run_preflight_checks
@@ -2363,6 +2363,7 @@ class MainWindow(QMainWindow):
 			tracks_override=active_tracks,
 			m3u_output_dir=self.ed_m3u_out.text().strip() or None,
 			row_indices=queued_rows,
+			max_workers=download_workers(load_settings()),
 			parent=self,
 		)
 		self.worker.sig_log.connect(self.lbl_log.setText)

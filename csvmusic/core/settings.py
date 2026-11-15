@@ -58,6 +58,16 @@ def load_settings() -> dict:
 		pass
 	return {}
 
+def download_workers(settings: dict) -> int:
+	value = settings.get("download_workers")
+	if isinstance(value, bool):
+		return 3
+	try:
+		number = int(value)
+	except (TypeError, ValueError):
+		return 3
+	return max(1, min(4, number))
+
 def _should_clear(value: object) -> bool:
 	if value is None:
 		return True

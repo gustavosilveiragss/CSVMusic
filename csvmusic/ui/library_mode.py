@@ -23,7 +23,7 @@ from csvmusic.core.library import (
 )
 from csvmusic.core.log import log
 from csvmusic.core.audio_quality import audio_quality
-from csvmusic.core.settings import load_settings, save_settings, settings_path
+from csvmusic.core.settings import download_workers, load_settings, save_settings, settings_path
 from csvmusic.core.paths import ffmpeg_path, resource_base
 from csvmusic.core.preflight import ffmpeg_supports_mp3
 from csvmusic.core.track_output import expected_track_path
@@ -3484,7 +3484,8 @@ class LibraryModeDialog(QDialog):
 			legacy_options=legacy, force_download=bool(cfg.get("force_download_mode", False)),
 			tracks_override=tracks, m3u_tracks_override=all_playlist_tracks,
 			m3u_output_dir=cfg.get("m3u_output_dir"),
-			row_indices=list(range(len(tracks))), parent=self,
+			row_indices=list(range(len(tracks))),
+			max_workers=download_workers(cfg), parent=self,
 		)
 		self.download_worker.sig_total.connect(self._download_total)
 		self.download_worker.sig_log.connect(self._download_log_message)

@@ -167,8 +167,10 @@ class PipelineWorker(QThread):
 	             m3u_tracks_override: List[Dict] | None = None,
 	             m3u_output_dir: str | None = None,
 	             row_indices: List[int] | None = None,
+	             max_workers: int = 1,
 	             parent: QObject | None = None):
 		super().__init__(parent)
+		self.max_workers = max_workers
 		self.csv_path = csv_path
 		self.out_dir = pathlib.Path(out_dir)
 		self.playlist = playlist
