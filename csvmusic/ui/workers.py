@@ -1,13 +1,14 @@
 # tabs only
 from PySide6.QtCore import QObject, Signal, QThread
-import pathlib, traceback, time, random
+import pathlib, traceback, time
 from contextlib import nullcontext
-from dataclasses import dataclass, replace
+from contextvars import ContextVar
+from dataclasses import dataclass, field, replace
 import subprocess
 import json
 import sqlite3
 import re, unicodedata
-from typing import List, Dict
+from typing import Callable, List, Dict
 
 from ytmusicapi import YTMusic
 
@@ -15,7 +16,8 @@ from csvmusic.core.csv_import import load_csv, tracks_from_csv
 from csvmusic.core.url_import import fetch_music_url
 from csvmusic.core.log import log
 from csvmusic.core.timing import timed
-from csvmusic.core.ytmusic_match import find_best, more_candidates, RATE_LIMIT_S, CONFIDENCE_MIN
+from csvmusic.core.ytmusic_match import find_best, more_candidates, CONFIDENCE_MIN, SearchHealth
+from csvmusic.core.download_pool import track_pause_s
 from csvmusic.core.downloader import (
 	download_m4a, download_mp3, download_opus, tag_file, yt_thumbnail_bytes, cover_art_url_bytes, write_m3u, sanitize_name,
 	youtube_batch_mitigation, build_ytdlp_mitigation_args, detect_youtube_risk,
@@ -178,6 +180,41 @@ class TrackJob:
 	track_playlist_name: str
 
 
+@dataclass(frozen=True)
+class _JobContext:
+	emit: Callable[..., None]
+	audio_processing: Dict
+
+
+# Per-job state read by the download helpers, so jobs never share mutable worker attributes.
+_JOB_CONTEXT: ContextVar[_JobContext | None] = ContextVar("csvmusic_job_context", default=None)
+
+
+@dataclass
+class _MatchSkip:
+	row_idx: int
+	track: Dict
+	payload: Dict
+	status: str
+	reason: str
+	options: List[Dict]
+	abort_reason: str | None
+
+
+@dataclass
+class _BatchState:
+	total: int
+	playlist_name: str
+	health: SearchHealth = field(default_factory=SearchHealth)
+	matched: int = 0
+	skipped_count: int = 0
+	processed: int = 0
+	abort_reason: str | None = None
+	done_tracks: List[Dict] = field(default_factory=list)
+	failed_tracks: List[Dict] = field(default_factory=list)
+	skipped_tracks: List[Dict] = field(default_factory=list)
+
+
 @dataclass
 class TrackOutcome:
 	row_idx: int
@@ -230,7 +267,6 @@ class PipelineWorker(QThread):
 		self.cookies_browser = cookies_browser
 		self.cookies_file = cookies_file
 		self.audio_processing = audio_processing or {}
-		self._active_audio_processing = dict(self.audio_processing)
 		self.mp3_quality = max(0, min(10, int(mp3_quality)))
 		self.legacy_options = legacy_options or {}
 		self.force_download = bool(force_download)
@@ -248,12 +284,13 @@ class PipelineWorker(QThread):
 		from csvmusic.core.downloader import take_download_notices, download_notice_handler
 		take_download_notices()
 		try:
-			with download_notice_handler(lambda notice: self.sig_log.emit(f"[recovery] {notice}")):
+			with download_notice_handler(lambda notice: self._job_context().emit("log", f"[recovery] {notice}")):
 				return self._download_with_profile_impl(vid, dest_dir, base, profile)
 		finally:
 			take_download_notices()
 
 	def _download_with_profile_impl(self, vid: str, dest_dir: pathlib.Path, base: str, profile: YouTubeMitigationProfile):
+		audio_processing = self._job_context().audio_processing
 		extra_args: list[str] = []
 		if self.cookies_file:
 			extra_args += ["--cookies", self.cookies_file]
@@ -261,18 +298,24 @@ class PipelineWorker(QThread):
 			extra_args += ["--cookies-from-browser", self.cookies_browser]
 		extra_args += build_ytdlp_mitigation_args(profile)
 		if self.fmt == "m4a":
-			return download_m4a(vid, dest_dir, base, yt_dlp_bin=self.yt_dlp_path, ffmpeg_bin=self.ffmpeg_path_override, extra_yt_dlp_args=extra_args or None, audio_processing=self._active_audio_processing)
+			return download_m4a(vid, dest_dir, base, yt_dlp_bin=self.yt_dlp_path, ffmpeg_bin=self.ffmpeg_path_override, extra_yt_dlp_args=extra_args or None, audio_processing=audio_processing)
 		if self.fmt == "opus":
 			return download_opus(vid, dest_dir, base, yt_dlp_bin=self.yt_dlp_path, ffmpeg_bin=self.ffmpeg_path_override, extra_yt_dlp_args=extra_args or None)
-		return download_mp3(vid, dest_dir, base, yt_dlp_bin=self.yt_dlp_path, ffmpeg_bin=self.ffmpeg_path_override, extra_yt_dlp_args=extra_args or None, audio_processing=self._active_audio_processing, mp3_quality=self.mp3_quality, cbr_bitrate_kbps=_legacy_cbr_bitrate(self.legacy_options))
+		return download_mp3(vid, dest_dir, base, yt_dlp_bin=self.yt_dlp_path, ffmpeg_bin=self.ffmpeg_path_override, extra_yt_dlp_args=extra_args or None, audio_processing=audio_processing, mp3_quality=self.mp3_quality, cbr_bitrate_kbps=_legacy_cbr_bitrate(self.legacy_options))
 
-	def _set_track_audio_processing(self, track: Dict) -> None:
+	def _job_context(self) -> _JobContext:
+		ctx = _JOB_CONTEXT.get()
+		if ctx is None:
+			raise RuntimeError("no active download job")
+		return ctx
+
+	def _track_audio_processing(self, track: Dict) -> Dict:
 		processing = dict(self.audio_processing)
 		track_gain = max(-12, min(12, int(track.get("audio_volume_gain", 0) or 0)))
 		if track_gain:
 			processing["enabled"] = True
 			processing["volume_gain"] = int(processing.get("volume_gain", 0) or 0) + track_gain
-		self._active_audio_processing = processing
+		return processing
 
 	def _apply_mitigation(self, profile: YouTubeMitigationProfile, reason: str | None = None) -> None:
 		if profile.label == self._mitigation.label:
@@ -284,12 +327,6 @@ class PipelineWorker(QThread):
 				msg = f"{msg}\n\nDetected: {reason}"
 			self.sig_log.emit(f"[warn] {msg}")
 			self.sig_warning.emit(msg)
-
-	def _track_pause_s(self) -> float:
-		if self._mitigation.track_sleep_s <= 0:
-			return RATE_LIMIT_S
-		jitter = min(1.0, self._mitigation.track_sleep_s * 0.2)
-		return max(RATE_LIMIT_S, random.uniform(self._mitigation.track_sleep_s - jitter, self._mitigation.track_sleep_s + jitter))
 
 	def _is_official_candidate(self, cand: Dict) -> bool:
 		source = str(cand.get("source") or "").lower()
@@ -413,7 +450,13 @@ class PipelineWorker(QThread):
 		return fp, cover, chosen
 
 	def _process_track(self, job: "TrackJob", emit) -> "TrackOutcome":
-		self._active_audio_processing = job.audio_processing
+		token = _JOB_CONTEXT.set(_JobContext(emit, job.audio_processing))
+		try:
+			return self._process_track_in_context(job, emit)
+		finally:
+			_JOB_CONTEXT.reset(token)
+
+	def _process_track_in_context(self, job: "TrackJob", emit) -> "TrackOutcome":
 		payload = _new_payload(job.track, job.options, job.match, job.confidence, job.track_playlist_name, job.forced_match)
 		payload["low_confidence"] = job.low_confidence
 		outcome = TrackOutcome(job.row_idx, payload)
@@ -438,6 +481,134 @@ class PipelineWorker(QThread):
 			payload["error"] = err
 			return outcome
 
+	def _match_track(self, yt, state: "_BatchState", row_idx: int, t: Dict) -> "TrackJob | _MatchSkip | TrackOutcome":
+		playlist_name = state.playlist_name
+		track_playlist_name = self.playlist or t.get("playlist") or playlist_name
+		dest_dir = self.out_dir / (sanitize_name(track_playlist_name) or "Playlist")
+		dest_dir.mkdir(parents=True, exist_ok=True)
+		title = t["title"]
+		artists = t["artists"]
+		audio_processing = self._track_audio_processing(t)
+		search_error = None
+		options: List[Dict] = []
+		match = None
+		confidence = 0.0
+		try:
+			preferred_video_id = str(t.get("preferred_video_id") or "").strip()
+			if preferred_video_id:
+				preferred_title = str(t.get("youtube_video_title") or t.get("preferred_video_label") or "").strip()
+				if preferred_title.startswith(("http://", "https://")):
+					preferred_title = title
+				match = {
+					"videoId": preferred_video_id,
+					"title": preferred_title or title,
+					"author": t.get("youtube_video_author") or artists,
+					"score": 1.0,
+				}
+				options = [match]
+				confidence = 1.0
+			else:
+				with timed("match"):
+					match, confidence, options = find_best(yt, t)
+		except Exception as exc:
+			search_error = str(exc)
+		abort_reason = state.health.record(search_error, bool(options))
+		forced = False
+		if match is None and self.force_download and options:
+			forced_candidates = self._force_download_candidates(t, options)
+			match = forced_candidates[0] if forced_candidates else options[0]
+			confidence = float(match.get("score", confidence or 0.0) or 0.0)
+			forced = True
+		payload = _new_payload(t, options, match, confidence, track_playlist_name, forced)
+
+		if match is None:
+			if search_error:
+				log(f"match skip: query='{t['title']} {t['artists']}' error={search_error}")
+				status = f"Search failed: {search_error[:100]}"
+			elif not options:
+				status = "Skipped (no search results)"
+			else:
+				log(f"match skip: query='{t['title']} {t['artists']}' no candidate >= threshold (confidence={confidence:.2f})")
+				status = "Skipped (low confidence)"
+			payload["skipped"] = True
+			payload["error"] = search_error
+			reason = search_error or ("No search results" if not options else "No confident match")
+			return _MatchSkip(row_idx, t, payload, status, reason, options, abort_reason)
+
+		state.matched += 1
+		self.sig_match_stats.emit(state.matched, state.skipped_count)
+		low_confidence = bool(forced or confidence < CONFIDENCE_MIN)
+		self.sig_row_status.emit(row_idx, f"Downloading low-confidence match ({self.fmt})…" if low_confidence else f"Downloading ({self.fmt})…")
+		try:
+			return TrackJob(
+				row_idx=row_idx, track=t, match=match, options=options, confidence=confidence,
+				low_confidence=low_confidence, forced_match=forced,
+				candidate_sequence=self._ordered_force_candidates(t, match, options),
+				dest_dir=dest_dir, base=track_filename_base(t), profile=self._mitigation,
+				audio_processing=audio_processing, safe_mode=False,
+				playlist_name=playlist_name, track_playlist_name=track_playlist_name,
+			)
+		except Exception as exc:
+			return self._fail_outcome(row_idx, t, payload, match, low_confidence, exc, playlist_name)
+
+	def _fail_outcome(self, row_idx: int, t: Dict, payload: Dict, match: Dict, low_confidence: bool, exc: Exception, playlist_name: str) -> "TrackOutcome":
+		err = str(exc)
+		log(f"download failure: playlist='{playlist_name}' track='{t['artists']} — {t['title']}' fmt={self.fmt} error={err}")
+		self.sig_row_status.emit(row_idx, f"Fail: {err[:120]}")
+		payload.update(match=match, low_confidence=low_confidence, error=err)
+		return TrackOutcome(row_idx, payload, error=err)
+
+	def _execute_job(self, job: "TrackJob") -> "TrackOutcome":
+		try:
+			return self._run_job(job)
+		except Exception as exc:
+			payload = _new_payload(job.track, job.options, job.match, job.confidence, job.track_playlist_name, job.forced_match)
+			return self._fail_outcome(job.row_idx, job.track, payload, job.match, job.low_confidence, exc, job.playlist_name)
+
+	def _record_skip(self, state: "_BatchState", skip: "_MatchSkip") -> None:
+		state.skipped_tracks.append({"track": skip.track, "reason": skip.reason, "options": skip.options})
+		self.sig_row_status.emit(skip.row_idx, skip.status)
+		state.processed += 1
+		self.sig_progress.emit(state.processed, state.total)
+		self.sig_track_result.emit(skip.row_idx, skip.payload)
+		state.skipped_count += 1
+		self.sig_match_stats.emit(state.matched, state.skipped_count)
+
+	def _finish_track(self, state: "_BatchState", t: Dict, outcome: "TrackOutcome", started: float) -> None:
+		if outcome.error is None:
+			state.done_tracks.append(t)
+		else:
+			state.failed_tracks.append({"track": t, "error": outcome.error})
+		state.processed += 1
+		self.sig_progress.emit(state.processed, state.total)
+		self._report_quality(outcome, t["title"])
+		log(f"timing: stage=track seconds={time.monotonic() - started:.1f} ok={outcome.error is None}")
+		self.sig_track_result.emit(outcome.row_idx, outcome.payload)
+
+	def _write_playlists(self, state: "_BatchState") -> None:
+		if state.done_tracks:
+			ext = self.fmt if self.fmt in ("m4a", "mp3", "opus") else "mp3"
+			by_playlist: dict[str, list[dict]] = {}
+			manifest_tracks = self.m3u_tracks_override if self.m3u_tracks_override is not None else state.done_tracks
+			for completed_track in manifest_tracks:
+				completed_playlist = self.playlist or completed_track.get("playlist") or state.playlist_name
+				expected_file = expected_track_path(completed_track, self.out_dir, ext)
+				if expected_file.exists():
+					by_playlist.setdefault(completed_playlist, []).append(completed_track)
+			for completed_playlist, playlist_tracks in by_playlist.items():
+				if self.write_m3u8:
+					m3u = write_m3u(self.out_dir, completed_playlist, playlist_tracks, ext, suffix=".m3u8", encoding="utf-8", playlist_output_dir=self.m3u_output_dir)
+					self.sig_log.emit(f"[m3u] wrote: {m3u}")
+				if self.write_m3u_plain:
+					m3u_plain = write_m3u(self.out_dir, completed_playlist, playlist_tracks, ext, suffix=".m3u", encoding="utf-8-sig", playlist_output_dir=self.m3u_output_dir)
+					self.sig_log.emit(f"[m3u] wrote: {m3u_plain}")
+		msg = "All tasks finished."
+		if self._stop:
+			msg = "Stopped (partial results saved)."
+		elif state.abort_reason:
+			msg = f"Stopped because search is unavailable. {state.abort_reason}"
+		self.sig_done.emit(msg, state.done_tracks, state.skipped_tracks, state.failed_tracks)
+
 	def run(self):
 		try:
 			self.sig_log.emit("[csv] loading…")
@@ -455,9 +626,7 @@ class PipelineWorker(QThread):
 			if self._mitigation.warning:
 				self.sig_log.emit(f"[warn] {self._mitigation.warning}")
 			self.sig_log.emit("[match] searching on YouTube Music…")
-			matched = 0
-			skipped_count = 0
-			self.sig_match_stats.emit(matched, skipped_count)
+			self.sig_match_stats.emit(0, 0)
 			try:
 				yt = YTMusic()
 			except Exception as exc:
@@ -465,158 +634,30 @@ class PipelineWorker(QThread):
 			playlist_name = self.playlist or (tracks[0]["playlist"] if tracks else "Playlist")
 			if not playlist_name:
 				playlist_name = "Playlist"
-			safe_playlist = sanitize_name(playlist_name) or "Playlist"
-			dest_dir = self.out_dir / safe_playlist
-			dest_dir.mkdir(parents=True, exist_ok=True)
-			done_tracks: List[Dict] = []
-			failed_tracks: List[Dict] = []
-			skipped_tracks: List[Dict] = []
-			consecutive_search_errors = 0
-			consecutive_empty_searches = 0
-			search_abort_reason: str | None = None
-			processed = 0
+			state = _BatchState(total=total, playlist_name=playlist_name)
+			(self.out_dir / (sanitize_name(playlist_name) or "Playlist")).mkdir(parents=True, exist_ok=True)
 			for idx, track in enumerate(tracks):
 				row_idx = self.row_indices[idx] if idx < len(self.row_indices) else idx
 				if self._stop:
 					break
-				t = track
-				track_started = time.monotonic()
-				track_playlist_name = self.playlist or t.get("playlist") or playlist_name
-				dest_dir = self.out_dir / (sanitize_name(track_playlist_name) or "Playlist")
-				dest_dir.mkdir(parents=True, exist_ok=True)
-				title = t["title"]
-				artists = t["artists"]
-				self._set_track_audio_processing(t)
-				search_error = None
-				options: List[Dict] = []
-				match = None
-				confidence = 0.0
-				try:
-					preferred_video_id = str(t.get("preferred_video_id") or "").strip()
-					if preferred_video_id:
-						preferred_title = str(t.get("youtube_video_title") or t.get("preferred_video_label") or "").strip()
-						if preferred_title.startswith(("http://", "https://")):
-							preferred_title = title
-						match = {
-							"videoId": preferred_video_id,
-							"title": preferred_title or title,
-							"author": t.get("youtube_video_author") or artists,
-							"score": 1.0,
-						}
-						options = [match]
-						confidence = 1.0
-					else:
-						with timed("match"):
-							match, confidence, options = find_best(yt, t)
-				except Exception as exc:
-					search_error = str(exc)
-				if search_error:
-					consecutive_search_errors += 1
-					consecutive_empty_searches = 0
-				elif not options:
-					consecutive_empty_searches += 1
-					consecutive_search_errors = 0
-				else:
-					consecutive_search_errors = 0
-					consecutive_empty_searches = 0
-				forced = False
-				if match is None and self.force_download and options:
-					forced_candidates = self._force_download_candidates(t, options)
-					match = forced_candidates[0] if forced_candidates else options[0]
-					confidence = float(match.get("score", confidence or 0.0) or 0.0)
-					forced = True
-				payload = _new_payload(t, options, match, confidence, track_playlist_name, forced)
-
-				if match is None:
-					if search_error:
-						log(f"match skip: query='{t['title']} {t['artists']}' error={search_error}")
-						status = f"Search failed: {search_error[:100]}"
-					elif not options:
-						status = "Skipped (no search results)"
-					else:
-						log(f"match skip: query='{t['title']} {t['artists']}' no candidate >= threshold (confidence={confidence:.2f})")
-						status = "Skipped (low confidence)"
-					payload["skipped"] = True
-					payload["error"] = search_error
-					reason = search_error or ("No search results" if not options else "No confident match")
-					skipped_tracks.append({"track": t, "reason": reason, "options": options})
-					self.sig_row_status.emit(row_idx, status)
-					processed += 1
-					self.sig_progress.emit(processed, total)
-					self.sig_track_result.emit(row_idx, payload)
-					skipped_count += 1
-					self.sig_match_stats.emit(matched, skipped_count)
-					if consecutive_search_errors >= 3:
-						search_abort_reason = f"YouTube Music search failed repeatedly: {search_error}"
-						self.sig_warning.emit(search_abort_reason)
-						break
-					if consecutive_empty_searches >= 5:
-						search_abort_reason = (
-							"YouTube Music returned no results for five tracks in a row. "
-							"This usually means YouTube Music search is temporarily rate-limiting or blocking requests from this network, "
-							"rather than five unrelated songs all being unavailable. Stop the batch, wait before retrying, and review the download log."
-						)
-						self.sig_warning.emit(search_abort_reason)
+				started = time.monotonic()
+				step = self._match_track(yt, state, row_idx, track)
+				if isinstance(step, _MatchSkip):
+					self._record_skip(state, step)
+					if step.abort_reason:
+						state.abort_reason = step.abort_reason
+						self.sig_warning.emit(step.abort_reason)
 						break
 					if not self._stop and idx < total - 1:
-						time.sleep(self._track_pause_s())
+						time.sleep(track_pause_s(self._mitigation))
 					continue
-
-				matched += 1
-				self.sig_match_stats.emit(matched, skipped_count)
-				low_confidence = bool(forced or confidence < CONFIDENCE_MIN)
-				self.sig_row_status.emit(row_idx, f"Downloading low-confidence match ({self.fmt})…" if low_confidence else f"Downloading ({self.fmt})…")
-				try:
-					job = TrackJob(
-						row_idx=row_idx, track=t, match=match, options=options, confidence=confidence,
-						low_confidence=low_confidence, forced_match=forced,
-						candidate_sequence=self._ordered_force_candidates(t, match, options),
-						dest_dir=dest_dir, base=track_filename_base(t), profile=self._mitigation,
-						audio_processing=self._active_audio_processing, safe_mode=False,
-						playlist_name=playlist_name, track_playlist_name=track_playlist_name,
-					)
-					outcome = self._run_job(job)
-				except Exception as exc:
-					err = str(exc)
-					log(f"download failure: playlist='{playlist_name}' track='{artists} — {title}' fmt={self.fmt} error={err}")
-					self.sig_row_status.emit(row_idx, f"Fail: {err[:120]}")
-					payload.update(match=match, low_confidence=low_confidence, error=err)
-					outcome = TrackOutcome(row_idx, payload, error=err)
-				if outcome.error is None:
-					done_tracks.append(t)
-				else:
-					failed_tracks.append({"track": t, "error": outcome.error})
-				processed += 1
-				self.sig_progress.emit(processed, total)
-				self._report_quality(outcome, title)
-				log(f"timing: stage=track seconds={time.monotonic() - track_started:.1f} ok={outcome.error is None}")
-				self.sig_track_result.emit(row_idx, outcome.payload)
+				outcome = step if isinstance(step, TrackOutcome) else self._execute_job(step)
+				self._finish_track(state, track, outcome, started)
 				if not self._stop and idx < total - 1:
 					with timed("pause"):
-						time.sleep(self._track_pause_s())
+						time.sleep(track_pause_s(self._mitigation))
 				time.sleep(0.02)
-			if done_tracks:
-				ext = self.fmt if self.fmt in ("m4a", "mp3", "opus") else "mp3"
-				by_playlist: dict[str, list[dict]] = {}
-				manifest_tracks = self.m3u_tracks_override if self.m3u_tracks_override is not None else done_tracks
-				for completed_track in manifest_tracks:
-					completed_playlist = self.playlist or completed_track.get("playlist") or playlist_name
-					expected_file = expected_track_path(completed_track, self.out_dir, ext)
-					if expected_file.exists():
-						by_playlist.setdefault(completed_playlist, []).append(completed_track)
-				for completed_playlist, playlist_tracks in by_playlist.items():
-					if self.write_m3u8:
-						m3u = write_m3u(self.out_dir, completed_playlist, playlist_tracks, ext, suffix=".m3u8", encoding="utf-8", playlist_output_dir=self.m3u_output_dir)
-						self.sig_log.emit(f"[m3u] wrote: {m3u}")
-					if self.write_m3u_plain:
-						m3u_plain = write_m3u(self.out_dir, completed_playlist, playlist_tracks, ext, suffix=".m3u", encoding="utf-8-sig", playlist_output_dir=self.m3u_output_dir)
-						self.sig_log.emit(f"[m3u] wrote: {m3u_plain}")
-			msg = "All tasks finished."
-			if self._stop:
-				msg = "Stopped (partial results saved)."
-			elif search_abort_reason:
-				msg = f"Stopped because search is unavailable. {search_abort_reason}"
-			self.sig_done.emit(msg, done_tracks, skipped_tracks, failed_tracks)
+			self._write_playlists(state)
 		except Exception:
 			self.sig_done.emit("Fatal error:\n" + traceback.format_exc(), [], [], [])
 

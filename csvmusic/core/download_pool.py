@@ -33,7 +33,7 @@ def concurrency_limit(requested: int, profile: YouTubeMitigationProfile, *, acco
 	return max(1, min(requested, cap))
 
 
-def track_pause_s(profile: YouTubeMitigationProfile, limit: int, *, uniform: Callable[[float, float], float] = random.uniform) -> float:
+def track_pause_s(profile: YouTubeMitigationProfile, limit: int = 1, *, uniform: Callable[[float, float], float] = random.uniform) -> float:
 	if profile.track_sleep_s <= 0:
 		base = RATE_LIMIT_S
 	else:

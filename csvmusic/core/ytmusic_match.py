@@ -396,3 +396,33 @@ def batch_match(tracks: List[Dict]) -> List[Dict]:
 		results.append(res)
 		time.sleep(RATE_LIMIT_S)
 	return results
+
+
+class SearchHealth:
+	"""Tracks consecutive search failures so a batch can stop when YouTube Music is unavailable."""
+	MAX_CONSECUTIVE_ERRORS = 3
+	MAX_CONSECUTIVE_EMPTY = 5
+
+	def __init__(self) -> None:
+		self.consecutive_search_errors = 0
+		self.consecutive_empty_searches = 0
+
+	def record(self, error: str | None, had_options: bool) -> str | None:
+		if error:
+			self.consecutive_search_errors += 1
+			self.consecutive_empty_searches = 0
+		elif not had_options:
+			self.consecutive_empty_searches += 1
+			self.consecutive_search_errors = 0
+		else:
+			self.consecutive_search_errors = 0
+			self.consecutive_empty_searches = 0
+		if self.consecutive_search_errors >= self.MAX_CONSECUTIVE_ERRORS:
+			return f"YouTube Music search failed repeatedly: {error}"
+		if self.consecutive_empty_searches >= self.MAX_CONSECUTIVE_EMPTY:
+			return (
+				"YouTube Music returned no results for five tracks in a row. "
+				"This usually means YouTube Music search is temporarily rate-limiting or blocking requests from this network, "
+				"rather than five unrelated songs all being unavailable. Stop the batch, wait before retrying, and review the download log."
+			)
+		return None
