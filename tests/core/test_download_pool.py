@@ -538,3 +538,34 @@ def test_controller_does_not_climb_on_completions_alone(monkeypatch) -> None:
 				pool.submit(batch * 10 + i, i, key=batch * 10 + i)
 			collect(pool, 6)
 		assert pool.limit == 3 and not logs
+
+
+def test_pressure_lowers_level_holds_during_cooldown_and_recovers() -> None:
+	from csvmusic.core.resources import Pressure
+
+	now = [0.0]
+	state = [Pressure.CRITICAL]
+	with DownloadPool(lambda i, c: i, PoolPolicy(4), N, clock=lambda: now[0], sampler=lambda: state[0]) as pool:
+		assert pool._adaptive.level == 3
+		pool.pump(0)
+		assert pool._adaptive.level == 1
+		for _ in range(40):  # 200 s of completions while pressure persists: no climb
+			now[0] += 5
+			pool.pump(0)
+			pool.track_done()
+		assert pool._adaptive.level == 1
+		state[0] = Pressure.OK
+		now[0] += 70
+		pool.pump(0)
+		actions = []
+		for _ in range(60):
+			now[0] += 5
+			actions.append(pool._adaptive.on_completion())
+		assert "climb" in actions
+
+
+def test_inline_pool_never_samples_pressure() -> None:
+	calls = []
+	with DownloadPool(lambda i, c: i, PoolPolicy(1), N, sampler=lambda: calls.append(1)) as pool:
+		pool.pump(0)
+	assert calls == []

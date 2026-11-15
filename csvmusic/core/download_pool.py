@@ -17,6 +17,7 @@ from .downloader import (
 	pacer_scope, process_scope, scale_profile_for_concurrency,
 )
 from .log import log
+from .resources import Pressure, read_pressure
 from .ytmusic_match import RATE_LIMIT_S
 
 MATCH_GAP_S = RATE_LIMIT_S  # floor between two searches; read as download_pool.MATCH_GAP_S so tests can zero it
@@ -92,14 +93,21 @@ class _InlineExecutor:
 		pass
 
 
+PRESSURE_SAMPLE_S = 5.0
+
+
 class DownloadPool:
 	"""The pool owns the mitigation profile, the cancel state and every wait of its coordinator."""
 
 	def __init__(
 		self, run: Callable[[Any, JobContext], Any], policy: PoolPolicy, profile: YouTubeMitigationProfile,
 		*, clock: Callable[[], float] = time.monotonic,
+		sampler: Callable[[], Pressure] | None = None,
 	) -> None:
 		self._run = run
+		self._clock = clock
+		self._sampler = sampler
+		self._next_sample = float("-inf")
 		self._policy = policy
 		self._profile = profile
 		self._lock = threading.Lock()
@@ -211,6 +219,7 @@ class DownloadPool:
 
 	def pump(self, timeout: float) -> list[JobEvent | Completion]:
 		"""Return queued events, waiting up to `timeout` for one even when idle; cancel() wakes the wait."""
+		self._sample_pressure()
 		self._dispatch()
 		out: list[Any] = []
 		self._drain(out)
@@ -221,6 +230,21 @@ class DownloadPool:
 				return []
 			self._drain(out)
 		return [self._collect(msg) for msg in out if msg is not _WAKE]
+
+	def _sample_pressure(self) -> None:
+		# Lowering the level never kills running jobs; _dispatch just waits until they fit.
+		# The controller starts at min(3, ceiling) whatever was requested, and HIGH/CRITICAL cut below that.
+		if not self._parallel:
+			return
+		now = self._clock()
+		if now < self._next_sample:
+			return
+		self._next_sample = now + PRESSURE_SAMPLE_S
+		pressure = (self._sampler or read_pressure)()
+		with self._lock:
+			action = self._adaptive.on_pressure(pressure)
+			if action:
+				log(f"concurrency: level={self._adaptive.level} pressure={pressure.name} action={action}")
 
 	def _has_work(self) -> bool:
 		with self._lock:

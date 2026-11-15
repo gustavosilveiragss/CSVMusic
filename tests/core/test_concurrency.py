@@ -1,6 +1,7 @@
 import pytest
 
 from csvmusic.core.concurrency import AdaptiveLimit, hard_cap
+from csvmusic.core.resources import Pressure
 
 
 class FakeClock:
@@ -159,3 +160,51 @@ def test_describe() -> None:
 	window(limit, clock, 0.5)
 	text = limit.describe()
 	assert "level=2" in text and "x_per_min=30.0" in text and "prev=30.0" in text
+
+
+def test_high_pressure_steps_down_once_per_cooldown_and_blocks_climb() -> None:
+	limit, clock = make(start=4, ceiling=4, cooldown_s=60.0)
+	assert limit.on_pressure(Pressure.OK) is None
+	assert limit.on_pressure(Pressure.HIGH) == "pressure_down"
+	assert limit.level == 3
+	clock.now += 5
+	assert limit.on_pressure(Pressure.HIGH) is None
+	assert limit.level == 3
+	clock.now += 56  # 61 s since the drop, but the second HIGH refreshed the cooldown
+	assert limit.on_pressure(Pressure.HIGH) == "pressure_down"
+	assert limit.level == 2
+
+
+def test_critical_halves_and_floors_at_one() -> None:
+	limit, clock = make(start=5, ceiling=5)
+	assert limit.on_pressure(Pressure.CRITICAL) == "pressure_down"
+	assert limit.level == 2
+	clock.now += 5
+	assert limit.on_pressure(Pressure.CRITICAL) is None  # inside critical_gap_s
+	assert limit.level == 2
+	clock.now += 10
+	assert limit.on_pressure(Pressure.CRITICAL) == "pressure_down"
+	assert limit.level == 1
+	assert limit.on_pressure(Pressure.CRITICAL) is None
+	assert limit.level == 1
+
+
+def test_no_climb_during_cooldown_then_climbs_after_fresh_measurement() -> None:
+	limit, clock = make(start=3, ceiling=4, cooldown_s=60.0)
+	limit.on_pressure(Pressure.HIGH)
+	assert limit.level == 2
+	assert all(r is None for r in feed(limit, clock, 40, 1.0))  # 40 s, inside the cooldown
+	clock.now += 30  # past the cooldown
+	assert window(limit, clock, 1.0) == "climb"
+	assert limit.level == 3
+
+
+def test_pressure_drops_comparison_base() -> None:
+	limit, clock = make(start=1, ceiling=4)
+	warm(limit, clock)
+	assert window(limit, clock, 1.0) == "climb"
+	limit.on_pressure(Pressure.CRITICAL)
+	clock.now += 100
+	warm(limit, clock)
+	# No stale base: the next window climbs instead of reverting against the pre-pressure rate.
+	assert window(limit, clock, 0.1) == "climb"

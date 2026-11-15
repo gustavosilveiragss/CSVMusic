@@ -6,6 +6,8 @@ import math
 import time
 from typing import Callable
 
+from .resources import Pressure
+
 
 def hard_cap(cpu_count: int | None) -> int:
 	if cpu_count is None:
@@ -25,11 +27,17 @@ class AdaptiveLimit:
 		epsilon: float = 0.10,
 		min_window_s: float = 30.0,
 		reprobe_s: float = 300.0,
+		cooldown_s: float = 60.0,
+		critical_gap_s: float = 15.0,
 	) -> None:
 		self._clock = clock
 		self._epsilon = epsilon
 		self._min_window_s = min_window_s
 		self._reprobe_s = reprobe_s
+		self._cooldown_s = cooldown_s
+		self._critical_gap_s = critical_gap_s
+		self._cooldown_until = float("-inf")
+		self._last_drop = float("-inf")
 		self._ceiling = max(1, ceiling)
 		self._level = max(1, min(start, self._ceiling))
 		self._base_x: float | None = None
@@ -73,10 +81,35 @@ class AdaptiveLimit:
 			self._trial = False
 			self._restart(warmup=True)
 
+	def on_pressure(self, pressure: Pressure) -> str | None:
+		"""HIGH steps down one level (at most once per cooldown), CRITICAL halves (at most once per critical_gap_s); neither lets the level climb until the pressure has been gone for the cooldown."""
+		if pressure == Pressure.OK:
+			return None
+		now = self._clock()
+		self._cooldown_until = now + self._cooldown_s
+		if pressure == Pressure.CRITICAL:
+			if now - self._last_drop < self._critical_gap_s:
+				return None
+			target = max(1, self._level // 2)
+		elif now - self._last_drop >= self._cooldown_s:
+			target = max(1, self._level - 1)
+		else:
+			return None
+		if target >= self._level:
+			return None
+		self._last_drop = now
+		self._level = target
+		self._base_x = None
+		self._trial = False
+		self._restart(warmup=True)
+		return "pressure_down"
+
 	def on_completion(self) -> str | None:
 		if self._ceiling <= 1:
 			return None
 		now = self._clock()
+		if now < self._cooldown_until:
+			return None
 		if self._plateau_since is not None:
 			if self._level < self._ceiling and now - self._plateau_since >= self._reprobe_s:
 				# Conditions drift: re-measure from scratch instead of comparing with a stale base.

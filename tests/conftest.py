@@ -16,6 +16,15 @@ except ImportError:
 	collect_ignore = ["ui", "test_app_environment.py"]
 
 
+@pytest.fixture(autouse=True)
+def calm_system(monkeypatch):
+	"""The host's real memory/CPU pressure must not change pool behaviour under test; tests inject their own sampler."""
+	from csvmusic.core import download_pool
+	from csvmusic.core.resources import Pressure
+
+	monkeypatch.setattr(download_pool, "read_pressure", lambda: Pressure.OK)
+
+
 @pytest.fixture(scope="session", autouse=True)
 def qt_application():
 	"""Keep one Qt application alive until all test widgets are disposed."""
