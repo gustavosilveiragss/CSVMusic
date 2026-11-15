@@ -59,6 +59,59 @@ _YOUTUBE_LARGE_BATCH_THRESHOLD = 250
 _YOUTUBE_EXTREME_BATCH_THRESHOLD = 500
 
 class DownloadError(Exception): pass
+class DownloadCancelled(DownloadError): pass
+
+
+class CancelToken:
+	"""Kills every subprocess registered on it once cancelled."""
+
+	def __init__(self) -> None:
+		self._lock = threading.Lock()
+		self._procs: set[subprocess.Popen] = set()
+		self._cancelled = False
+
+	@property
+	def cancelled(self) -> bool:
+		return self._cancelled
+
+	def cancel(self) -> None:
+		with self._lock:
+			self._cancelled = True
+			procs = list(self._procs)
+		for proc in procs:
+			_kill(proc)
+
+	def register(self, proc: subprocess.Popen) -> None:
+		with self._lock:
+			self._procs.add(proc)
+			cancelled = self._cancelled
+		if cancelled:
+			_kill(proc)
+
+	def unregister(self, proc: subprocess.Popen) -> None:
+		with self._lock:
+			self._procs.discard(proc)
+
+
+def _kill(proc: subprocess.Popen) -> None:
+	try:
+		proc.kill()
+	except OSError:
+		pass
+
+
+_active_token = threading.local()
+
+
+@contextlib.contextmanager
+def process_scope(token: CancelToken):
+	"""Make token the active one for subprocesses started on this thread."""
+	previous = getattr(_active_token, "token", None)
+	_active_token.token = token
+	try:
+		yield
+	finally:
+		_active_token.token = previous
 
 
 class AgeRestrictedError(DownloadError):
@@ -134,6 +187,8 @@ YOUTUBE_MITIGATION_AGGRESSIVE = YouTubeMitigationProfile(
 _TARGET_LOUDNESS_I = -16.0
 _TARGET_TRUE_PEAK_DB = -2.5
 _MAX_SAFE_NAME_LENGTH = 140
+YTDLP_TIMEOUT_S = 900
+FFMPEG_TIMEOUT_S = 600
 
 def _run(cmd: list[str]) -> int:
 	proc = _run_capture(cmd)
@@ -150,9 +205,13 @@ def _timing_fields(cmd: list[str]) -> dict[str, str]:
 	client = next((arg.split("=", 1)[1] for arg in cmd if arg.startswith("youtube:player_client=")), "default")
 	return {"tool": tool, "client": client, "url": cmd[-1]}
 
-def _run_capture(cmd: list[str]) -> subprocess.CompletedProcess[str]:
-	with timed("process", **_timing_fields(cmd)) as info:
-		proc = subprocess.run(
+def _run_capture(cmd: list[str], *, timeout: float | None = None) -> subprocess.CompletedProcess[str]:
+	fields = _timing_fields(cmd)
+	if timeout is None:
+		timeout = YTDLP_TIMEOUT_S if fields["tool"].startswith("yt-dlp") else FFMPEG_TIMEOUT_S
+	token = getattr(_active_token, "token", None)
+	with timed("process", **fields) as info:
+		proc = subprocess.Popen(
 			cmd,
 			stdout=subprocess.PIPE,
 			stderr=subprocess.PIPE,
@@ -161,8 +220,25 @@ def _run_capture(cmd: list[str]) -> subprocess.CompletedProcess[str]:
 			errors="replace",
 			**subprocess_kwargs()
 		)
+		if token is not None:
+			token.register(proc)
+		try:
+			try:
+				stdout, stderr = proc.communicate(timeout=timeout)
+			except subprocess.TimeoutExpired:
+				proc.kill()
+				proc.communicate()
+				info["rc"] = proc.returncode
+				if token is not None and token.cancelled:
+					raise DownloadCancelled("download cancelled") from None
+				raise DownloadError(f"{fields['tool']} timed out after {timeout:g}s") from None
+		finally:
+			if token is not None:
+				token.unregister(proc)
 		info["rc"] = proc.returncode
-	return proc
+	if token is not None and token.cancelled:
+		raise DownloadCancelled("download cancelled")
+	return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
 
 def _run_ytdlp_module(args: list[str]) -> tuple[int, str, str]:
 	with timed("process", **_timing_fields([INTERNAL_YTDLP, *args])) as info:
