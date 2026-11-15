@@ -4,7 +4,7 @@ from dataclasses import dataclass, replace
 from collections.abc import Callable
 from typing import Dict, Optional, List
 import re, unicodedata
-import threading
+import threading, time, random
 from mutagen.easyid3 import EasyID3
 from mutagen.id3 import ID3, APIC
 from mutagen.mp4 import MP4, MP4Cover
@@ -114,6 +114,60 @@ def process_scope(token: CancelToken):
 		_active_token.token = previous
 
 
+class YtdlpPacer:
+	"""Global limiter: spaces the start of every yt-dlp launch across threads."""
+
+	_POLL_S = 0.25
+
+	def __init__(self, min_gap_s: float, jitter_s: float, cancel: CancelToken | None = None, *, clock: Callable[[], float] = time.monotonic, sleep: Callable[[float], object] | None = None) -> None:
+		self._lock = threading.Lock()
+		self._min_gap_s = min_gap_s
+		self._jitter_s = jitter_s
+		self._cancel = cancel
+		self._clock = clock
+		self._sleep = sleep or threading.Event().wait
+		self._next_slot = 0.0
+
+	def set_gap(self, min_gap_s: float, jitter_s: float) -> None:
+		with self._lock:
+			self._min_gap_s = min_gap_s
+			self._jitter_s = jitter_s
+
+	def acquire(self) -> None:
+		with self._lock:
+			now = self._clock()
+			start = max(now, self._next_slot)
+			gap = self._min_gap_s + random.uniform(-self._jitter_s, self._jitter_s)
+			self._next_slot = start + max(0.0, gap)
+		while True:
+			if self._cancel is not None and self._cancel.cancelled:
+				raise DownloadCancelled("Download cancelled")
+			remaining = start - self._clock()
+			if remaining <= 0:
+				return
+			self._sleep(min(remaining, self._POLL_S))
+
+
+_active_pacer = threading.local()
+
+
+@contextlib.contextmanager
+def pacer_scope(pacer: YtdlpPacer | None):
+	"""Make pacer the active one for yt-dlp launches on this thread."""
+	previous = getattr(_active_pacer, "pacer", None)
+	_active_pacer.pacer = pacer
+	try:
+		yield
+	finally:
+		_active_pacer.pacer = previous
+
+
+def _pace_ytdlp() -> None:
+	pacer = getattr(_active_pacer, "pacer", None)
+	if pacer is not None:
+		pacer.acquire()
+
+
 class AgeRestrictedError(DownloadError):
 	"""The selected video needs an eligible authenticated YouTube session."""
 
@@ -183,6 +237,29 @@ YOUTUBE_MITIGATION_AGGRESSIVE = YouTubeMitigationProfile(
 	warning="YouTube reported a request limit. Applying slower download pacing automatically; waiting before retrying may still be necessary.",
 	reason="YouTube rate-limit response",
 )
+
+
+_PACER_GAPS = {
+	YOUTUBE_MITIGATION_NONE.label: (3.0, 0.5),
+	YOUTUBE_MITIGATION_LARGE_BATCH.label: (8.0, 2.0),
+	YOUTUBE_MITIGATION_AGGRESSIVE.label: (12.0, 2.0),
+}
+
+
+def pacer_gap_for_profile(profile: YouTubeMitigationProfile) -> tuple[float, float]:
+	"""Hypothetical (min_gap_s, jitter_s) between yt-dlp launches; to be calibrated."""
+	return _PACER_GAPS.get(profile.label, _PACER_GAPS[YOUTUBE_MITIGATION_NONE.label])
+
+
+def scale_profile_for_concurrency(profile: YouTubeMitigationProfile, n: int) -> YouTubeMitigationProfile:
+	"""Divide the per-process limit_rate by n so the total bandwidth stays put."""
+	if n <= 1 or not profile.limit_rate:
+		return profile
+	match = re.fullmatch(r"(\d+(?:\.\d+)?)([KkMm]?)", profile.limit_rate.strip())
+	if not match:
+		return profile
+	kb = float(match.group(1)) * (1000 if match.group(2).lower() == "m" else 1)
+	return replace(profile, limit_rate=f"{max(50, int(kb // n))}K")
 
 _TARGET_LOUDNESS_I = -16.0
 _TARGET_TRUE_PEAK_DB = -2.5
@@ -349,6 +426,16 @@ def detect_youtube_risk(detail: str) -> str | None:
 	return None
 
 
+_BOT_CHECK_PATTERNS = ("not a bot", "bot verification")
+
+
+def detect_concurrency_risk(detail: str) -> str | None:
+	text = (detail or "").lower().replace("\u2019", "'")
+	if any(pattern in text for pattern in _BOT_CHECK_PATTERNS):
+		return "YouTube bot check"
+	return detect_youtube_risk(detail)
+
+
 def build_ytdlp_mitigation_args(profile: YouTubeMitigationProfile | None) -> list[str]:
 	if not profile or not profile.active:
 		return []
@@ -421,6 +508,7 @@ def _run_ytdlp_detail(cmd: list[str]) -> tuple[int, str]:
 	capture_source("")
 	cmd = cmd[:1] + ["--no-simulate", "--print", "after_move:%(.{id,format_id,acodec,vcodec,abr,tbr})j"] + cmd[1:]
 	# Keep authentication unless a media-only 403 warrants one public retry.
+	_pace_ytdlp()
 	if cmd and cmd[0] == INTERNAL_YTDLP:
 		rc, stdout, stderr = _run_ytdlp_module(cmd[1:])
 	else:
@@ -441,6 +529,7 @@ def _run_ytdlp_detail(cmd: list[str]) -> tuple[int, str]:
 	):
 		_download_notice("Signed-in YouTube media request returned HTTP 403. Retrying this video once without cookies; saved account settings are unchanged.")
 		public_cmd = _strip_cookie_args(cmd) + ["--ignore-config", "--no-cookies", "--no-cookies-from-browser", "--no-continue"]
+		_pace_ytdlp()
 		if public_cmd[0] == INTERNAL_YTDLP:
 			public_rc, public_out, public_err = _run_ytdlp_module(public_cmd[1:])
 		else:
